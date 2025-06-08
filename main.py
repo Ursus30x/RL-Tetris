@@ -5,8 +5,22 @@ from tetris_env import TetrisEnv  # Your env module
 from agent import ImprovedTetrisAgent  # Your agent module
 
 # Normalize grid (e.g., convert 0-7 -> 0.0-1.0)
-def normalize_state(grid):
+def normalize_state(obs):
+    """Normalize the grid and include the current falling piece"""
+    grid = obs["grid"].copy()
+    piece = obs["current_piece"]
+    pos = obs["current_pos"]
+
+    px, py = pos
+    for y in range(piece.shape[0]):
+        for x in range(piece.shape[1]):
+            if piece[y][x]:
+                gx, gy = px + y, py + x
+                if 0 <= gx < grid.shape[0] and 0 <= gy < grid.shape[1]:
+                    grid[gx][gy] = piece[y][x]  # Use color/ID of the piece
+
     return grid.astype(np.float32) / 7.0
+
 
 # Main training loop
 def train_tetris_agent(episodes=1000, render_every=200):

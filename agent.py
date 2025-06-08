@@ -136,10 +136,10 @@ class ImprovedTetrisAgent:
         # Hyperparameters - dostrojone
         self.epsilon = 1.0
         self.epsilon_min = 0.01
-        self.epsilon_decay = 0.99995  # Wolniejszy decay
-        self.gamma = 0.99
-        self.batch_size = 32
-        self.target_update = 500  # Częstsze aktualizacje
+        self.epsilon_decay = 0.9995  # Wolniejszy decay
+        self.gamma = 0.98
+        self.batch_size = 64
+        self.target_update = 1000  # Częstsze aktualizacje
         self.steps = 0
         
         # Training statistics

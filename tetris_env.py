@@ -164,12 +164,21 @@ class TetrisEnv:
                     holes += 1
         return holes
 
+    def get_observation(self):
+        obs = {
+            "grid": self.grid.copy(),
+            "current_piece": self.current_piece.copy(),
+            "current_pos": tuple(self.current_pos)
+        }
+        return obs
+
+
     def step(self, action):
         if self.game_over:
             return self.grid.copy(), self.death_penalty, True
 
         px, py = self.current_pos
-        reward = -0.1  # small step penalty to encourage faster play
+        reward = 0.1  # small step penalty to encourage faster play
 
         frozen_this_step = False
         cleared = 0
@@ -199,10 +208,12 @@ class TetrisEnv:
             max_height = self.get_max_height()
             holes = self.get_hole_count()
             reward += cleared * 10  # reward clearing lines
-            reward -= max_height * 0.5  # penalty for tall towers
-            reward -= holes * 1.0  # penalty for holes
+            #reward -= max_height * 0.1 # penalty for tall towers
+            #reward -= holes * 1.0       # penalty for holes
 
-        return self.grid.copy(), reward, self.game_over
+            #print(f"Reward components -> cleared: {cleared*10}, height_penalty: {-max_height*0.5}, holes_penalty: {-holes*1.0}")
+
+        return self.get_observation(), reward, self.game_over
 
     def render(self):
         if not self.render_mode:
@@ -242,7 +253,7 @@ class TetrisEnv:
         self.score = 0
         self.game_over = False
         self.spawn_piece()
-        return self.grid.copy()
+        return self.get_observation()
 
     def close(self):
         if self.render_mode:
