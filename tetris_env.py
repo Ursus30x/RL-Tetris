@@ -173,16 +173,49 @@ class TetrisEnv:
         return obs
 
 
+    def get_bumpiness(self):
+        """Oblicz nierówność powierzchni - różnice wysokości między sąsiednimi kolumnami"""
+        heights = []
+        for col in range(self.grid.shape[1]):
+            height = 0
+            for row in range(self.grid.shape[0]):
+                if self.grid[row, col] != 0:
+                    height = self.grid.shape[0] - row
+                    break
+            heights.append(height)
+        
+        bumpiness = sum(abs(heights[i] - heights[i+1]) for i in range(len(heights)-1))
+        return bumpiness
+
+    def get_aggregate_height(self):
+        """Suma wysokości wszystkich kolumn"""
+        total_height = 0
+        for col in range(self.grid.shape[1]):
+            for row in range(self.grid.shape[0]):
+                if self.grid[row, col] != 0:
+                    total_height += self.grid.shape[0] - row
+                    break
+        return total_height
+
     def step(self, action):
         if self.game_over:
-            return self.grid.copy(), self.death_penalty, True
+            return self.get_observation(), self.death_penalty, True
 
         px, py = self.current_pos
-        reward = 0.1  # small step penalty to encourage faster play
+        reward = self.step_penalty  # Mała kara za każdy krok
+        
+        old_completed_lines = self.get_almost_completed_lines()
+        old_connected_blocks = self.get_connected_blocks()
+
+        # Zapisz stan przed akcją dla porównania
+        old_max_height = self.get_max_height()
+        old_holes = self.get_hole_count()
+        old_bumpiness = self.get_bumpiness()
 
         frozen_this_step = False
         cleared = 0
 
+        # Wykonaj akcję
         if action == 0 and not self.collision(self.current_piece, (px, py - 1)):
             self.current_pos[1] -= 1
         elif action == 1 and not self.collision(self.current_piece, (px, py + 1)):
@@ -191,12 +224,16 @@ class TetrisEnv:
             rotated = self.rotate(self.current_piece)
             if not self.collision(rotated, self.current_pos):
                 self.current_piece = rotated
-        elif action == 3:
+        elif action == 3:  # Hard drop
+            drop_distance = 0
             while not self.collision(self.current_piece, (self.current_pos[0] + 1, self.current_pos[1])):
                 self.current_pos[0] += 1
+                drop_distance += 1
             frozen_this_step = True
             cleared = self.freeze()
+            reward += self.drop_bonus * drop_distance  # Bonus za szybkie upuszczenie
 
+        # Naturalne opadanie
         if not frozen_this_step:
             if not self.collision(self.current_piece, (self.current_pos[0] + 1, self.current_pos[1])):
                 self.current_pos[0] += 1
@@ -204,16 +241,79 @@ class TetrisEnv:
                 frozen_this_step = True
                 cleared = self.freeze()
 
+        # Oblicz nagrody po zamrożeniu klocka
         if frozen_this_step:
-            max_height = self.get_max_height()
-            holes = self.get_hole_count()
-            reward += cleared * 10  # reward clearing lines
-            #reward -= max_height * 0.1 # penalty for tall towers
-            #reward -= holes * 1.0       # penalty for holes
+            # Zwiększona nagroda za usunięte linie
+            if cleared > 0:
+                line_reward = self.line_rewards.get(str(cleared), 0)
+                reward += line_reward * 2.5  # Zwiększona nagroda za linie
+                
+            # Oblicz nowe metryki heurystyczne
+            new_completed_lines = self.get_almost_completed_lines()
+            new_connected_blocks = self.get_connected_blocks()
+            
+            # Nagroda za tworzenie prawie ukończonych linii
+            completed_lines_change = new_completed_lines - old_completed_lines
+            reward += completed_lines_change * 1.2
+            
+            # Nagroda za łączenie bloków
+            connected_blocks_change = new_connected_blocks - old_connected_blocks
+            reward += connected_blocks_change * 0.8
 
-            #print(f"Reward components -> cleared: {cleared*10}, height_penalty: {-max_height*0.5}, holes_penalty: {-holes*1.0}")
+            # Dodatkowe metryki do oceny jakości ruchu
+            new_max_height = self.get_max_height()
+            new_holes = self.get_hole_count()
+            new_bumpiness = self.get_bumpiness()
+            
+            # Zwiększone kary za tworzenie dziur
+            holes_change = new_holes - old_holes
+            reward -= holes_change * 3.0  # Silniejsza kara za dziury
+            
+            # Kara za zwiększenie wysokości
+            height_change = new_max_height - old_max_height
+            reward -= height_change * 0.7
+            
+            # Kara za zwiększenie nierówności
+            bumpiness_change = new_bumpiness - old_bumpiness
+            reward -= bumpiness_change * 0.5
+            
+            # Bonus za niską wysokość przy braku dziur
+            if new_holes == 0 and new_max_height < 8:  # Obniżony próg wysokości
+                reward += 1.0  # Zwiększony bonus
+                
+            # Bonus za równą powierzchnię
+            if new_bumpiness < 2:  # Zaostrzony warunek
+                reward += 0.7  # Zwiększony bonus
 
         return self.get_observation(), reward, self.game_over
+
+    # Dodane nowe funkcje pomocnicze
+    def get_almost_completed_lines(self):
+        """Zlicza linie, w których brakuje tylko 1-2 bloków do ukończenia"""
+        count = 0
+        for row in range(self.grid.shape[0]):
+            if 1 <= np.count_nonzero(self.grid[row] == 0) <= 2:
+                count += 1
+        return count
+
+    def get_connected_blocks(self):
+        """Zlicza bloki, które mają sąsiadów w poziomie lub pionie"""
+        connected = 0
+        for y in range(self.grid.shape[0]):
+            for x in range(self.grid.shape[1]):
+                if self.grid[y][x] != 0:
+                    # Sprawdź sąsiadów: lewy, prawy, dolny
+                    neighbors = 0
+                    if x > 0 and self.grid[y][x-1] != 0:
+                        neighbors += 1
+                    if x < self.grid.shape[1]-1 and self.grid[y][x+1] != 0:
+                        neighbors += 1
+                    if y < self.grid.shape[0]-1 and self.grid[y+1][x] != 0:
+                        neighbors += 1
+                    
+                    if neighbors >= 2:  # Blok z co najmniej 2 sąsiadami
+                        connected += 1
+        return connected
 
     def render(self):
         if not self.render_mode:

@@ -16,19 +16,17 @@ import os
 
 class StackedFramesDQN(nn.Module):
     """DQN z możliwością przetwarzania kilku klatek jednocześnie"""
-    def __init__(self, input_shape, n_actions, n_frames=4):
-        super(StackedFramesDQN, self).__init__()
-        
-        self.n_frames = n_frames
+    def __init__(self, input_shape, n_actions, n_channels):
+        super(StackedFramesDQN, self).__init__() 
         
         # CNN layers - dostosowane do większej liczby kanałów
-        self.conv1 = nn.Conv2d(n_frames, 32, kernel_size=3, stride=1, padding=1)
+        self.conv1 = nn.Conv2d(n_channels, 32, kernel_size=3, stride=1, padding=1)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
         self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1)
 
         
         # Oblicz rozmiar po convolution
-        conv_out_size = self._get_conv_out((n_frames, input_shape[1], input_shape[2]))
+        conv_out_size = self._get_conv_out((n_channels, input_shape[1], input_shape[2]))
         
         # Dueling DQN architecture
         self.advantage = nn.Sequential(
@@ -119,27 +117,30 @@ class ImprovedTetrisAgent:
         self.n_frames = n_frames
         
         # Sieci neuronowe z Dueling DQN
-        self.q_net = StackedFramesDQN(state_shape, n_actions, n_frames).to(self.device)
-        self.target_net = StackedFramesDQN(state_shape, n_actions, n_frames).to(self.device)
-        self.target_net.load_state_dict(self.q_net.state_dict())
+        input_channels = n_frames * 2
+        self.q_net = StackedFramesDQN((input_channels, state_shape[1], state_shape[2]), n_actions, input_channels).to(self.device)
+        self.target_net = StackedFramesDQN((input_channels, state_shape[1], state_shape[2]), n_actions, input_channels).to(self.device)
         
         # Optimizer z learning rate scheduling
-        self.optimizer = optim.Adam(self.q_net.parameters(), lr=lr)
-        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=1000, gamma=0.95)
+        self.optimizer = optim.Adam(self.q_net.parameters(), lr=lr, weight_decay=1e-5)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='max', factor=0.8, patience=100
+        )
         
         # Prioritized Replay Buffer
-        self.memory = PrioritizedReplayBuffer(50000)
+        self.memory = PrioritizedReplayBuffer(100000)  # Zwiększony rozmiar bufora
         
         # Frame stacking
         self.frame_stack = deque(maxlen=n_frames)
         
-        # Hyperparameters - dostrojone
+        # Hyperparameters - zoptymalizowane
         self.epsilon = 1.0
-        self.epsilon_min = 0.01
-        self.epsilon_decay = 0.9995  # Wolniejszy decay
-        self.gamma = 0.98
-        self.batch_size = 64
-        self.target_update = 1000  # Częstsze aktualizacje
+        self.epsilon_min = 0.01  # Wyższe minimum
+        self.epsilon_decay = 0.99997  # Wolniejszy decay
+        self.gamma = 0.995  # Wyższa wartość gamma
+        self.batch_size = 64  # Większy batch
+        self.target_update = 3000  # Częstsze aktualizacje target network
+        self.warmup_steps = 1000  # Więcej kroków rozgrzewkowych
         self.steps = 0
         
         # Training statistics
@@ -149,19 +150,25 @@ class ImprovedTetrisAgent:
             'rewards': [],
             'epsilon': [],
             'losses': [],
-            'learning_rates': []
+            'learning_rates': [],
+            'avg_rewards': []
         }
+    
+        # Dodatkowe metryki
+        self.recent_rewards = deque(maxlen=100)
+        self.best_avg_reward = float('-inf')
         
     def preprocess_state(self, state):
-        """Przetwórz stan i dodaj do stack"""
+        """Przetwórz stan i dodaj do stack. Łączy kanały wszystkich klatek."""
         if len(self.frame_stack) == 0:
-            # Wypełnij stack pierwszą klatką
             for _ in range(self.n_frames):
                 self.frame_stack.append(state)
         else:
             self.frame_stack.append(state)
-            
-        return np.stack(self.frame_stack, axis=0)
+        # Zamiast stackować po nowej osi, łącz kanały
+        # state shape: (2, 20, 10), frame_stack: n_frames x (2, 20, 10)
+        # Chcemy shape: (n_frames * 2, 20, 10)
+        return np.concatenate(list(self.frame_stack), axis=0)
         
     def reset_frame_stack(self):
         """Reset frame stack na początku epizodu"""
@@ -172,28 +179,37 @@ class ImprovedTetrisAgent:
         self.memory.push(state, action, reward, next_state, done)
         
     def act(self, state, training=True):
-        """Wybierz akcję używając epsilon-greedy z noise injection"""
-        if training and np.random.random() <= self.epsilon:
+        """Ulepszona strategia wyboru akcji z adaptive exploration"""
+        # Zwiększ eksplorację gdy performance spada
+        adaptive_epsilon = self.epsilon
+        if training and len(self.recent_rewards) > 50:
+            recent_avg = np.mean(list(self.recent_rewards)[-50:])
+            if recent_avg < np.mean(list(self.recent_rewards)):
+                adaptive_epsilon = min(self.epsilon * 1.5, 0.3)  # Zwiększ eksplorację
+        
+        if training and np.random.random() <= adaptive_epsilon:
             return random.randrange(self.n_actions)
         
         # Konwertuj state do tensora
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        q_values = self.q_net(state_tensor)
         
-        if training:
-            # Dodaj szum do eksploracji
-            noise = torch.randn_like(q_values) * 0.1 * self.epsilon
-            q_values += noise
+        with torch.no_grad():
+            q_values = self.q_net(state_tensor)
             
+            if training and adaptive_epsilon > 0.1:
+                # Dodaj szum tylko przy wysokiej eksploracji
+                noise = torch.randn_like(q_values) * 0.05 * adaptive_epsilon
+                q_values += noise
+                
         return q_values.argmax().item()
         
     def replay(self):
-        """Trenuj sieć na batch z prioritized replay buffer"""
-        if len(self.memory) < self.batch_size:
+        """Zoptymalizowany trening z adaptive learning"""
+        if len(self.memory) < max(self.batch_size, self.warmup_steps):
             return None
             
         # Sample z prioritized replay
-        batch, indices, weights = self.memory.sample(self.batch_size)
+        batch, indices, weights = self.memory.sample(self.batch_size, beta=min(1.0, 0.4 + self.steps * 0.0001))
         states, actions, rewards, next_states, dones = zip(*batch)
         
         # Konwertuj do tensorów
@@ -204,39 +220,65 @@ class ImprovedTetrisAgent:
         dones = torch.BoolTensor(np.array(dones)).to(self.device)
         weights = torch.FloatTensor(np.array(weights)).to(self.device)
         
-        # Double DQN
-        current_q_values = self.q_net(states).gather(1, actions.unsqueeze(1))
-        next_actions = self.q_net(next_states).argmax(1)
-        next_q_values = self.target_net(next_states).gather(1, next_actions.unsqueeze(1)).squeeze()
-        target_q_values = rewards + (self.gamma * next_q_values * ~dones)
+        # Double DQN z Dueling
+        with torch.no_grad():
+            next_actions = self.q_net(next_states).argmax(1)
+            next_q_values = self.target_net(next_states).gather(1, next_actions.unsqueeze(1)).squeeze()
+            target_q_values = rewards + (self.gamma * next_q_values * ~dones)
+        
+        current_q_values = self.q_net(states).gather(1, actions.unsqueeze(1)).squeeze()
         
         # TD errors dla prioritized replay
-        td_errors = torch.abs(current_q_values.squeeze() - target_q_values).detach().cpu().numpy()
+        td_errors = torch.abs(current_q_values - target_q_values).detach().cpu().numpy()
         
-        # Weighted loss
-        loss = (weights * F.mse_loss(current_q_values.squeeze(), target_q_values, reduction='none')).mean()
+        # Huber loss dla stabilności
+        loss = F.smooth_l1_loss(current_q_values, target_q_values, reduction='none')
+        loss = (weights * loss).mean()
         
-        # Backpropagation
+        # Backpropagation z gradient clipping
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), 10)  # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), 1.0)
         self.optimizer.step()
-        self.scheduler.step()
         
         # Update priorities
         self.memory.update_priorities(indices, td_errors + 1e-6)
         
-        # Aktualizuj epsilon
+        # Wolniejszy decay epsilonu
         if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
             
-        # Aktualizuj target network
+        # Aktualizuj target network rzadziej
         self.steps += 1
         if self.steps % self.target_update == 0:
             self.target_net.load_state_dict(self.q_net.state_dict())
+            print(f"Target network updated at step {self.steps}")
             
         return loss.item()
+
+    def update_stats(self, episode, reward):
+        """Aktualizuj statystyki trenowania"""
+        self.recent_rewards.append(reward)
+        self.training_stats['episodes'].append(episode)
+        self.training_stats['rewards'].append(reward)
+        self.training_stats['epsilon'].append(self.epsilon)
         
+        # Oblicz średnią z ostatnich 100 epizodów
+        if len(self.recent_rewards) >= 50:
+            avg_reward = np.mean(list(self.recent_rewards)[-50:])
+            self.training_stats['avg_rewards'].append(avg_reward)
+            
+            # Aktualizuj learning rate scheduler
+            self.scheduler.step(avg_reward)
+            
+            # Zapisz najlepszy model
+            if avg_reward > self.best_avg_reward:
+                self.best_avg_reward = avg_reward
+                print(f"New best average reward: {avg_reward:.2f}")
+                
+            return avg_reward
+        return reward
+
     def save(self, filename):
         """Zapisz model i statystyki"""
         torch.save({

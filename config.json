@@ -1,11 +1,19 @@
 {
   "step_penalty": -0.01,
-  "drop_bonus": 1,
-  "death_penalty": -10.0,
+  "drop_bonus": 0.5,
+  "death_penalty": -100.0,
   "line_rewards": {
-    "1": 40,
-    "2": 100,
-    "3": 300,
+    "1": 150,    
+    "2": 350,
+    "3": 600,
     "4": 1200
-  }
+  },
+  "placement_bonus": 1.0,
+  "height_penalty_multiplier": 0.7,
+  "hole_penalty_multiplier": 3.5,  
+  "bumpiness_penalty_multiplier": 0.5,
+  "low_height_bonus": 1.2,        
+  "smooth_surface_bonus": 0.8,
+  "line_completion_bonus": 1.2,
+  "block_connection_bonus": 0.8
 }
