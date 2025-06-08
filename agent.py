@@ -128,7 +128,7 @@ class ImprovedTetrisAgent:
         )
         
         # Prioritized Replay Buffer
-        self.memory = PrioritizedReplayBuffer(500000)  # Zwiększony rozmiar bufora
+        self.memory = PrioritizedReplayBuffer(50000)  # Zwiększony rozmiar bufora
         
         # Frame stacking
         self.frame_stack = deque(maxlen=n_frames)
@@ -182,7 +182,7 @@ class ImprovedTetrisAgent:
         """Ulepszona strategia wyboru akcji z adaptive exploration"""
         # Zwiększ eksplorację gdy performance spada
         adaptive_epsilon = self.epsilon
-        if training and len(self.recent_rewards) > 50:
+        if training and len(self.recent_rewards) > 50 :
             recent_avg = np.mean(list(self.recent_rewards)[-50:])
             if recent_avg < np.mean(list(self.recent_rewards)):
                 adaptive_epsilon = min(self.epsilon * 1.5, 0.3)  # Zwiększ eksplorację
@@ -203,7 +203,7 @@ class ImprovedTetrisAgent:
                 
         return q_values.argmax().item()
         
-    def replay(self):
+    def replay(self,episodes):
         """Zoptymalizowany trening z adaptive learning"""
         if len(self.memory) < max(self.batch_size, self.warmup_steps):
             return None
@@ -245,7 +245,7 @@ class ImprovedTetrisAgent:
         self.memory.update_priorities(indices, td_errors + 1e-6)
         
         # Wolniejszy decay epsilonu
-        if self.epsilon > self.epsilon_min:
+        if self.epsilon > self.epsilon_min and episodes > 1000:
             self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
             
         # Aktualizuj target network rzadziej

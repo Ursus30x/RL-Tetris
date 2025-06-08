@@ -36,7 +36,7 @@ def normalize_state(obs):
 
 
 # Main training loop
-def train_tetris_agent(episodes=2000, render_every=50, save_every=100, eval_every=100):
+def train_tetris_agent(episodes=2000, render_every=500, save_every=100, eval_every=100):
     env = TetrisEnv(render_mode=False)  # Wyłącz rendering dla szybszego treningu
     n_frames = 4
     state_shape = (n_frames * 2, 20, 10)  # 2 kanały * 4 klatki
@@ -72,7 +72,7 @@ def train_tetris_agent(episodes=2000, render_every=50, save_every=100, eval_ever
             
             # Trenuj częściej przy dużym buforze
             if len(agent.memory) > agent.warmup_steps:
-                loss = agent.replay()
+                loss = agent.replay(episode)
                 if loss is not None:
                     agent.training_stats['losses'].append(loss)
 
