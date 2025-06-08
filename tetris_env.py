@@ -3,6 +3,7 @@ import pygame
 import random
 import json
 import os
+import sys
 
 # Game constants
 GRID_WIDTH = 10
@@ -12,29 +13,30 @@ FPS = 100
 
 # Colors
 COLORS = [
-    (0, 0, 0),        # Empty
-    (0, 255, 255),    # I
-    (0, 0, 255),      # J
-    (255, 165, 0),    # L
-    (255, 255, 0),    # O
-    (0, 255, 0),      # S
-    (128, 0, 128),    # T
-    (255, 0, 0),      # Z
+    (0, 0, 0),  # Empty
+    (0, 255, 255),  # I
+    (0, 0, 255),  # J
+    (255, 165, 0),  # L
+    (255, 255, 0),  # O
+    (0, 255, 0),  # S
+    (128, 0, 128),  # T
+    (255, 0, 0),  # Z
 ]
 
 # Tetrimino shapes
 SHAPES = [
-    [[1, 1, 1, 1]],              # I
-    [[2, 0, 0], [2, 2, 2]],      # J
-    [[0, 0, 3], [3, 3, 3]],      # L
-    [[4, 4], [4, 4]],            # O
-    [[0, 5, 5], [5, 5, 0]],      # S
-    [[0, 6, 0], [6, 6, 6]],      # T
-    [[7, 7, 0], [0, 7, 7]],      # Z
+    [[1, 1, 1, 1]],  # I
+    [[2, 0, 0], [2, 2, 2]],  # J
+    [[0, 0, 3], [3, 3, 3]],  # L
+    [[4, 4], [4, 4]],  # O
+    [[0, 5, 5], [5, 5, 0]],  # S
+    [[0, 6, 0], [6, 6, 6]],  # T
+    [[7, 7, 0], [0, 7, 7]],  # Z
 ]
 
+
 class TetrisEnv:
-    def __init__(self, render_mode=False,  config_path="config.json"):
+    def __init__(self, render_mode=False, config_path="config.json"):
         # Load config
         self.reward_config = self.load_config(config_path)
 
@@ -43,8 +45,6 @@ class TetrisEnv:
         self.drop_bonus = self.reward_config.get("drop_bonus", 0.1)
         self.death_penalty = self.reward_config.get("death_penalty", -1.0)
         self.line_rewards = self.reward_config.get("line_rewards", {"1": 40, "2": 100, "3": 300, "4": 1200})
-
-
 
         self.grid = np.zeros((GRID_HEIGHT, GRID_WIDTH), dtype=int)
         self.score = 0
@@ -56,18 +56,37 @@ class TetrisEnv:
         self.spawn_piece()
 
         if self.render_mode:
+            # Windows-specific pygame initialization
+            if sys.platform.startswith('win'):
+                os.environ['SDL_VIDEODRIVER'] = 'windib'
+
             pygame.init()
+            pygame.display.init()
+
             self.screen = pygame.display.set_mode((GRID_WIDTH * BLOCK_SIZE, GRID_HEIGHT * BLOCK_SIZE))
             pygame.display.set_caption("Tetris RL")
-            self.clock = pygame.time.Clock()
 
+            try:
+                self.clock = pygame.time.Clock()
+            except pygame.error as e:
+                print(f"Warning: Clock initialization failed: {e}")
+                self.clock = None
 
     def load_config(self, path):
-        if os.path.exists(path):
-            with open(path, 'r') as f:
-                return json.load(f)
-        else:
-            print("Config file not found. Using defaults.")
+        try:
+            # Używaj ścieżki względnej do pliku
+            if not os.path.isabs(path):
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                path = os.path.join(script_dir, path)
+
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            else:
+                print(f"Config file not found at {path}. Using defaults.")
+                return {}
+        except Exception as e:
+            print(f"Error loading config: {e}. Using defaults.")
             return {}
 
     def spawn_piece(self):
@@ -82,15 +101,13 @@ class TetrisEnv:
         for y in range(piece.shape[0]):
             for x in range(piece.shape[1]):
                 if piece[y][x] and (
-                    y + px >= GRID_HEIGHT or
-                    x + py < 0 or
-                    x + py >= GRID_WIDTH or
-                    self.grid[y + px][x + py]
+                        y + px >= GRID_HEIGHT or
+                        x + py < 0 or
+                        x + py >= GRID_WIDTH or
+                        self.grid[y + px][x + py]
                 ):
                     return True
         return False
-
-
 
     def freeze(self):
         """Fix current piece into the grid and check for line clears"""
@@ -101,31 +118,29 @@ class TetrisEnv:
                     self.grid[px + i][py + j] = 1
         lines_cleared = self.clear_lines()
         self.spawn_piece()
-        
-        return lines_cleared
 
+        return lines_cleared
 
     def clear_lines(self):
         # Keep only rows that are NOT fully filled (not all True/non-zero)
         new_grid = [row for row in self.grid if not np.all(row)]
-        
+
         lines_cleared = GRID_HEIGHT - len(new_grid)
-        
+
         if lines_cleared > 0:
             self.score += lines_cleared
-            
+
             # Create empty rows at the top for cleared lines
             empty_rows = np.zeros((lines_cleared, GRID_WIDTH), dtype=int)
-            
+
             # Stack empty rows above the remaining grid rows
             self.grid = np.vstack((empty_rows, np.array(new_grid)))
-        
-        return lines_cleared
 
+        return lines_cleared
 
     def rotate(self, piece):
         return np.rot90(piece, -1)
-    
+
     def line_clear_reward(self, lines_cleared):
         return self.line_rewards.get(str(lines_cleared), 0)
 
@@ -149,8 +164,6 @@ class TetrisEnv:
                     holes += 1
         return holes
 
-
-
     def step(self, action):
         if self.game_over:
             return self.grid.copy(), self.death_penalty, True
@@ -172,54 +185,57 @@ class TetrisEnv:
         elif action == 3:
             while not self.collision(self.current_piece, (self.current_pos[0] + 1, self.current_pos[1])):
                 self.current_pos[0] += 1
-            self.freeze()
             frozen_this_step = True
-            cleared = self.clear_lines()
+            cleared = self.freeze()
 
         if not frozen_this_step:
             if not self.collision(self.current_piece, (self.current_pos[0] + 1, self.current_pos[1])):
                 self.current_pos[0] += 1
             else:
-                self.freeze()
                 frozen_this_step = True
-                cleared = self.clear_lines()
+                cleared = self.freeze()
 
         if frozen_this_step:
             max_height = self.get_max_height()
             holes = self.get_hole_count()
             reward += cleared * 10  # reward clearing lines
             reward -= max_height * 0.5  # penalty for tall towers
-            reward -= holes * 1.0       # penalty for holes
-
-            #print(f"Reward components -> cleared: {cleared*10}, height_penalty: {-max_height*0.5}, holes_penalty: {-holes*1.0}")
+            reward -= holes * 1.0  # penalty for holes
 
         return self.grid.copy(), reward, self.game_over
-
 
     def render(self):
         if not self.render_mode:
             return
-        self.screen.fill((0, 0, 0))
 
-        for y in range(GRID_HEIGHT):
-            for x in range(GRID_WIDTH):
-                val = self.grid[y][x]
-                pygame.draw.rect(self.screen, COLORS[val], (x * BLOCK_SIZE, y * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE), 0)
+        try:
+            self.screen.fill((0, 0, 0))
 
-        # Draw current piece
-        px, py = self.current_pos
-        for y in range(self.current_piece.shape[0]):
-            for x in range(self.current_piece.shape[1]):
-                if self.current_piece[y][x]:
-                    pygame.draw.rect(
-                        self.screen,
-                        COLORS[self.current_piece[y][x]],
-                        ((py + x) * BLOCK_SIZE, (px + y) * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE),
-                        0
-                    )
+            for y in range(GRID_HEIGHT):
+                for x in range(GRID_WIDTH):
+                    val = self.grid[y][x]
+                    pygame.draw.rect(self.screen, COLORS[val], (x * BLOCK_SIZE, y * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE),
+                                     0)
 
-        pygame.display.flip()
-        self.clock.tick(FPS)
+            # Draw current piece
+            px, py = self.current_pos
+            for y in range(self.current_piece.shape[0]):
+                for x in range(self.current_piece.shape[1]):
+                    if self.current_piece[y][x]:
+                        pygame.draw.rect(
+                            self.screen,
+                            COLORS[self.current_piece[y][x]],
+                            ((py + x) * BLOCK_SIZE, (px + y) * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE),
+                            0
+                        )
+
+            pygame.display.flip()
+
+            if self.clock:
+                self.clock.tick(FPS)
+
+        except pygame.error as e:
+            print(f"Render error: {e}")
 
     def reset(self):
         self.grid = np.zeros((GRID_HEIGHT, GRID_WIDTH), dtype=int)
@@ -230,7 +246,11 @@ class TetrisEnv:
 
     def close(self):
         if self.render_mode:
-            pygame.quit()
+            try:
+                pygame.quit()
+            except:
+                pass
+
 
 def get_user_action():
     """
@@ -260,6 +280,8 @@ if __name__ == "__main__":
     env = TetrisEnv(render_mode=True)
     obs = env.reset()
     done = False
+
+    print("Sterowanie: Strzałki - ruch, ESC - wyjście")
 
     while not done:
         action = get_user_action()
