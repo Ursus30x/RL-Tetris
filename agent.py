@@ -1,303 +1,231 @@
-import pygame
 import numpy as np
-import cv2
-from collections import deque
-import random
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import json
-import time
-from datetime import datetime
-import os
+from torch.cuda.amp import GradScaler, autocast
+from collections import deque, namedtuple
+import random
+import math
 
+# Define a transition tuple for experience replay
+Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
 
-class StackedFramesDQN(nn.Module):
-    """DQN z możliwością przetwarzania kilku klatek jednocześnie"""
-    def __init__(self, input_shape, n_actions, n_channels):
-        super(StackedFramesDQN, self).__init__() 
-        
-        # CNN layers - dostosowane do większej liczby kanałów
-        self.conv1 = nn.Conv2d(n_channels, 32, kernel_size=3, stride=1, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1)
-
-        
-        # Oblicz rozmiar po convolution
-        conv_out_size = self._get_conv_out((n_channels, input_shape[1], input_shape[2]))
-        
-        # Dueling DQN architecture
-        self.advantage = nn.Sequential(
-            nn.Linear(conv_out_size, 512),
-            nn.ReLU(),
-            nn.Linear(512, n_actions)
-        )
-        
-        self.value = nn.Sequential(
-            nn.Linear(conv_out_size, 512), 
-            nn.ReLU(),
-            nn.Linear(512, 1)
-        )
-        
-    def _get_conv_out(self, shape):
-        """Oblicz rozmiar wyjścia z warstw konwolucyjnych"""
-        o = torch.zeros(1, *shape)
-        o = F.relu(self.conv1(o))
-        o = F.relu(self.conv2(o))
-        o = F.relu(self.conv3(o))
-        return int(np.prod(o.size()))
-    
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = x.view(x.size(0), -1)  # Flatten
-        
-        advantage = self.advantage(x)
-        value = self.value(x)
-        
-        # Dueling DQN formula
-        return value + advantage - advantage.mean(dim=1, keepdim=True)
-
-
-class PrioritizedReplayBuffer:
-    """Prioritized Experience Replay Buffer"""
-    def __init__(self, capacity, alpha=0.6):
-        self.capacity = capacity
-        self.alpha = alpha
-        self.buffer = []
-        self.priorities = deque(maxlen=capacity)
-        self.position = 0
-        
-    def push(self, state, action, reward, next_state, done):
-        max_priority = max(self.priorities) if self.priorities else 1.0
-        
-        if len(self.buffer) < self.capacity:
-            self.buffer.append((state, action, reward, next_state, done))
-        else:
-            self.buffer[self.position] = (state, action, reward, next_state, done)
-        
-        self.priorities.append(max_priority)
-        self.position = (self.position + 1) % self.capacity
-        
-    def sample(self, batch_size, beta=0.4):
-        if len(self.buffer) == self.capacity:
-            priorities = np.array(self.priorities)
-        else:
-            priorities = np.array(list(self.priorities)[:len(self.buffer)])
-            
-        probabilities = priorities ** self.alpha
-        probabilities /= probabilities.sum()
-        
-        indices = np.random.choice(len(self.buffer), batch_size, p=probabilities)
-        samples = [self.buffer[idx] for idx in indices]
-        
-        # Importance sampling weights
-        total = len(self.buffer)
-        weights = (total * probabilities[indices]) ** (-beta)
-        weights /= weights.max()
-        
-        return samples, indices, weights
-    
-    def update_priorities(self, indices, priorities):
-        for idx, priority in zip(indices, priorities):
-            self.priorities[idx] = priority
-            
-    def __len__(self):
-        return len(self.buffer)
 
 class ImprovedTetrisAgent:
-    def __init__(self, state_shape, n_actions, lr=0.0005, n_frames=4):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {self.device}")
-        
+    def __init__(self, state_shape, n_actions, n_frames=4, use_amp=True):
+        # The state_shape should be the shape AFTER frame stacking
+        # So if single frame is (2,20,10), with n_frames=4 it becomes (8,20,10)
+        self.state_shape = (state_shape[0] * n_frames, *state_shape[1:])
         self.n_actions = n_actions
         self.n_frames = n_frames
+        self.use_amp = use_amp
         
-        # Sieci neuronowe z Dueling DQN
-        input_channels = n_frames * 2
-        self.q_net = StackedFramesDQN((input_channels, state_shape[1], state_shape[2]), n_actions, input_channels).to(self.device)
-        self.target_net = StackedFramesDQN((input_channels, state_shape[1], state_shape[2]), n_actions, input_channels).to(self.device)
+        # Device setup
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Optimizer z learning rate scheduling
-        self.optimizer = optim.Adam(self.q_net.parameters(), lr=lr, weight_decay=1e-5)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='max', factor=0.8, patience=100
-        )
-        
-        # Prioritized Replay Buffer
-        self.memory = PrioritizedReplayBuffer(50000)  # Zwiększony rozmiar bufora
-        
-        # Frame stacking
+        # Initialize frame stack with proper device
         self.frame_stack = deque(maxlen=n_frames)
+        self._init_frame_stack()
         
-        # Hyperparameters - zoptymalizowane
+        # Network setup - now uses the full stacked shape
+        self.model = TetrisDQN(self.state_shape[0], n_actions).to(self.device)
+        self.target_model = TetrisDQN(self.state_shape[0], n_actions).to(self.device)
+        self.target_model.load_state_dict(self.model.state_dict())
+        
+        # Rest of initialization...
+        self.memory = deque(maxlen=100000)
+        self.batch_size = 128
+        self.gamma = 0.99
         self.epsilon = 1.0
-        self.epsilon_min = 0.01  # Wyższe minimum
-        self.epsilon_decay = 0.99997  # Wolniejszy decay
-        self.gamma = 0.995  # Wyższa wartość gamma
-        self.batch_size = 64  # Większy batch
-        self.target_update = 3000  # Częstsze aktualizacje target network
-        self.warmup_steps = 1000  # Więcej kroków rozgrzewkowych
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.9995
+        self.warmup_steps = 2000
+        self.tau = 0.005
+        
         self.steps = 0
-        
-        # Training statistics
-        self.training_stats = {
-            'episodes': [],
-            'scores': [],
-            'rewards': [],
-            'epsilon': [],
-            'losses': [],
-            'learning_rates': [],
-            'avg_rewards': []
-        }
-    
-        # Dodatkowe metryki
         self.recent_rewards = deque(maxlen=100)
-        self.best_avg_reward = float('-inf')
+        self.training_stats = {'losses': [], 'q_values': []}
         
-    def preprocess_state(self, state):
-        """Przetwórz stan i dodaj do stack. Łączy kanały wszystkich klatek."""
-        if len(self.frame_stack) == 0:
-            for _ in range(self.n_frames):
-                self.frame_stack.append(state)
-        else:
-            self.frame_stack.append(state)
-        # Zamiast stackować po nowej osi, łącz kanały
-        # state shape: (2, 20, 10), frame_stack: n_frames x (2, 20, 10)
-        # Chcemy shape: (n_frames * 2, 20, 10)
-        return np.concatenate(list(self.frame_stack), axis=0)
-        
-    def reset_frame_stack(self):
-        """Reset frame stack na początku epizodu"""
+        self.scaler = GradScaler(enabled=use_amp)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4, weight_decay=1e-5)
+
+    def _init_frame_stack(self):
+        """Initialize frame stack with zeros on correct device"""
         self.frame_stack.clear()
+        for _ in range(self.n_frames):
+            # Single frame shape is (2,20,10)
+            self.frame_stack.append(
+                torch.zeros((2, 20, 10), dtype=torch.float32).to(self.device))
+    
+    def reset_frame_stack(self):
+        """Reset frame stack between episodes"""
+        self._init_frame_stack()
+    
+    def preprocess_state(self, state):
+        """Convert numpy state to tensor and update frame stack"""
+        # Convert to tensor and move to device
+        state_tensor = torch.from_numpy(state).float().to(self.device)
         
-    def remember(self, state, action, reward, next_state, done):
-        """Zapisz doświadczenie w prioritized replay buffer"""
-        self.memory.push(state, action, reward, next_state, done)
+        # Update frame stack
+        self.frame_stack.append(state_tensor)
         
-    def act(self, state, training=True):
-        """Ulepszona strategia wyboru akcji z adaptive exploration"""
-        # Zwiększ eksplorację gdy performance spada
-        adaptive_epsilon = self.epsilon
-        if training and len(self.recent_rewards) > 50 :
-            recent_avg = np.mean(list(self.recent_rewards)[-50:])
-            if recent_avg < np.mean(list(self.recent_rewards)):
-                adaptive_epsilon = min(self.epsilon * 1.5, 0.3)  # Zwiększ eksplorację
-        
-        if training and np.random.random() <= adaptive_epsilon:
+        # Stack frames along channel dimension
+        stacked_state = torch.cat(list(self.frame_stack), dim=0)
+        return stacked_state.unsqueeze(0)  # Add batch dimension
+    
+    
+    def act(self, state, training=False):
+        """Select action using epsilon-greedy policy"""
+        if training and random.random() < self.epsilon:
             return random.randrange(self.n_actions)
         
-        # Konwertuj state do tensora
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        
         with torch.no_grad():
-            q_values = self.q_net(state_tensor)
-            
-            if training and adaptive_epsilon > 0.1:
-                # Dodaj szum tylko przy wysokiej eksploracji
-                noise = torch.randn_like(q_values) * 0.05 * adaptive_epsilon
-                q_values += noise
-                
+            if self.use_amp:
+                with autocast():
+                    q_values = self.model(state)
+            else:
+                q_values = self.model(state)
+        
         return q_values.argmax().item()
-        
-    def replay(self,episodes):
-        """Zoptymalizowany trening z adaptive learning"""
-        if len(self.memory) < max(self.batch_size, self.warmup_steps):
+    
+    def remember(self, state, action, reward, next_state, done):
+        """Store experience in replay buffer"""
+        self.memory.append(Transition(state, action, reward, next_state, done))
+    
+    def replay(self, episode):
+        """Train on a batch of experiences from memory"""
+        if len(self.memory) < self.batch_size:
             return None
+        
+        # Sample batch
+        transitions = random.sample(self.memory, self.batch_size)
+        batch = Transition(*zip(*transitions))
+        
+        # Convert to tensors
+        state_batch = torch.cat(batch.state).to(self.device)
+        action_batch = torch.tensor(batch.action, device=self.device).unsqueeze(1)
+        reward_batch = torch.tensor(batch.reward, device=self.device, dtype=torch.float32)
+        next_state_batch = torch.cat([s for s in batch.next_state if s is not None]).to(self.device)
+        done_batch = torch.tensor(batch.done, device=self.device, dtype=torch.float32)
+        
+        # Compute Q values and loss with mixed precision
+        with autocast(enabled=self.use_amp):
+            # Current Q values
+            current_q = self.model(state_batch).gather(1, action_batch)
             
-        # Sample z prioritized replay
-        batch, indices, weights = self.memory.sample(self.batch_size, beta=min(1.0, 0.4 + self.steps * 0.0001))
-        states, actions, rewards, next_states, dones = zip(*batch)
+            # Target Q values
+            with torch.no_grad():
+                next_q = self.target_model(next_state_batch).max(1)[0]
+                target_q = reward_batch + (1 - done_batch) * self.gamma * next_q
+            
+            # Compute loss
+            loss = F.smooth_l1_loss(current_q.squeeze(), target_q)
         
-        # Konwertuj do tensorów
-        states = torch.FloatTensor(np.array(states)).to(self.device)
-        actions = torch.LongTensor(np.array(actions)).to(self.device)
-        rewards = torch.FloatTensor(np.array(rewards)).to(self.device)
-        next_states = torch.FloatTensor(np.array(next_states)).to(self.device)
-        dones = torch.BoolTensor(np.array(dones)).to(self.device)
-        weights = torch.FloatTensor(np.array(weights)).to(self.device)
-        
-        # Double DQN z Dueling
-        with torch.no_grad():
-            next_actions = self.q_net(next_states).argmax(1)
-            next_q_values = self.target_net(next_states).gather(1, next_actions.unsqueeze(1)).squeeze()
-            target_q_values = rewards + (self.gamma * next_q_values * ~dones)
-        
-        current_q_values = self.q_net(states).gather(1, actions.unsqueeze(1)).squeeze()
-        
-        # TD errors dla prioritized replay
-        td_errors = torch.abs(current_q_values - target_q_values).detach().cpu().numpy()
-        
-        # Huber loss dla stabilności
-        loss = F.smooth_l1_loss(current_q_values, target_q_values, reduction='none')
-        loss = (weights * loss).mean()
-        
-        # Backpropagation z gradient clipping
+        # Backpropagation with gradient scaling
         self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), 1.0)
-        self.optimizer.step()
+        self.scaler.scale(loss).backward()
         
-        # Update priorities
-        self.memory.update_priorities(indices, td_errors + 1e-6)
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10.0)
         
-        # Wolniejszy decay epsilonu
-        if self.epsilon > self.epsilon_min and episodes > 1000:
+        # Update weights
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        
+        # Update target network
+        self.soft_update_target_network()
+        
+        # Decay epsilon
+        if episode > 500:
             self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-            
-        # Aktualizuj target network rzadziej
-        self.steps += 1
-        if self.steps % self.target_update == 0:
-            self.target_net.load_state_dict(self.q_net.state_dict())
-            print(f"Target network updated at step {self.steps}")
-            
-        return loss.item()
-
-    def update_stats(self, episode, reward):
-        """Aktualizuj statystyki trenowania"""
-        self.recent_rewards.append(reward)
-        self.training_stats['episodes'].append(episode)
-        self.training_stats['rewards'].append(reward)
-        self.training_stats['epsilon'].append(self.epsilon)
+            self.steps += 1
         
-        # Oblicz średnią z ostatnich 100 epizodów
-        if len(self.recent_rewards) >= 50:
-            avg_reward = np.mean(list(self.recent_rewards)[-50:])
-            self.training_stats['avg_rewards'].append(avg_reward)
-            
-            # Aktualizuj learning rate scheduler
-            self.scheduler.step(avg_reward)
-            
-            # Zapisz najlepszy model
-            if avg_reward > self.best_avg_reward:
-                self.best_avg_reward = avg_reward
-                print(f"New best average reward: {avg_reward:.2f}")
-                
-            return avg_reward
-        return reward
-
+        # Store training stats
+        self.training_stats['losses'].append(loss.item())
+        avg_q = current_q.mean().item()
+        self.training_stats['q_values'].append(avg_q)
+        
+        # Log some stats occasionally
+        if episode % 100 == 0:
+            print(f"Step: {self.steps}, Loss: {loss.item():.4f}, Avg Q: {avg_q:.2f}, Epsilon: {self.epsilon:.4f}")
+        
+        return loss.item()
+    
+    def soft_update_target_network(self):
+        """Soft update target network parameters"""
+        for target_param, param in zip(self.target_model.parameters(), self.model.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
+    
+    def update_stats(self, episode, total_reward):
+        """Update training statistics and return average reward"""
+        self.recent_rewards.append(total_reward)
+        return np.mean(self.recent_rewards) if self.recent_rewards else 0
+    
     def save(self, filename):
-        """Zapisz model i statystyki"""
+        """Save model weights"""
         torch.save({
-            'q_net_state_dict': self.q_net.state_dict(),
-            'target_net_state_dict': self.target_net.state_dict(),
+            'model_state_dict': self.model.state_dict(),
+            'target_model_state_dict': self.target_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
             'epsilon': self.epsilon,
             'steps': self.steps,
             'training_stats': self.training_stats
         }, filename)
-        
+        print(f"Model saved to {filename}")
+    
     def load(self, filename):
-        """Wczytaj model i statystyki"""
-        checkpoint = torch.load(filename)
-        self.q_net.load_state_dict(checkpoint['q_net_state_dict'])
-        self.target_net.load_state_dict(checkpoint['target_net_state_dict'])
+        """Load model weights"""
+        checkpoint = torch.load(filename, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.target_model.load_state_dict(checkpoint['target_model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.epsilon = checkpoint['epsilon']
         self.steps = checkpoint['steps']
-        self.training_stats = checkpoint.get('training_stats', self.training_stats)
+        self.training_stats = checkpoint['training_stats']
+        print(f"Model loaded from {filename}")
+
+class TetrisDQN(nn.Module):
+    """Dueling DQN architecture with FP16 support"""
+    def __init__(self, input_channels, n_actions):
+        super(TetrisDQN, self).__init__()
+        
+        # Feature extraction - now accepts the full stacked channels
+        self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        
+        # Dueling network streams
+        self.value_stream = nn.Sequential(
+            nn.Linear(128 * 20 * 10, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1))
+        
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(128 * 20 * 10, 512),
+            nn.ReLU(),
+            nn.Linear(512, n_actions))
+        
+        # Initialize weights
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        # Input shape: (batch, channels, height, width)
+        x = x.float()  # Ensure input is float32
+        
+        # Feature extraction
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = x.flatten(start_dim=1)
+        
+        # Dueling streams
+        values = self.value_stream(x)
+        advantages = self.advantage_stream(x)
+        
+        # Combine streams
+        qvals = values + (advantages - advantages.mean(dim=1, keepdim=True))
+        return qvals
