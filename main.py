@@ -169,4 +169,4 @@ def train_tetris_agent(episodes=5000, render_every=500, save_every=100, eval_eve
     print("="*50)
 
 if __name__ == "__main__":
-    train_tetris_agent(episodes=5000)
+    train_tetris_agent(episodes=10000)

@@ -199,28 +199,19 @@ class TetrisEnv:
 
     def step(self, action):
         if self.game_over:
-            return self.get_observation(), self.death_penalty, True
+            return self.get_observation(), -2.0, True  # Game over penalty
 
-        px, py = self.current_pos
-        reward = self.step_penalty  # Mała kara za każdy krok
-        
-        old_completed_lines = self.get_almost_completed_lines()
-        old_connected_blocks = self.get_connected_blocks()
-
-        # Zapisz stan przed akcją dla porównania
-        old_max_height = self.get_max_height()
-        old_holes = self.get_hole_count()
-        old_bumpiness = self.get_bumpiness()
-
+        reward = 1.0  # Small positive reward for each step
         frozen_this_step = False
         cleared = 0
 
-        # Wykonaj akcję
-        if action == 0 and not self.collision(self.current_piece, (px, py - 1)):
+        # Execute action
+        px, py = self.current_pos
+        if action == 0 and not self.collision(self.current_piece, (px, py - 1)):  # Left
             self.current_pos[1] -= 1
-        elif action == 1 and not self.collision(self.current_piece, (px, py + 1)):
+        elif action == 1 and not self.collision(self.current_piece, (px, py + 1)):  # Right
             self.current_pos[1] += 1
-        elif action == 2:
+        elif action == 2:  # Rotate
             rotated = self.rotate(self.current_piece)
             if not self.collision(rotated, self.current_pos):
                 self.current_piece = rotated
@@ -231,9 +222,8 @@ class TetrisEnv:
                 drop_distance += 1
             frozen_this_step = True
             cleared = self.freeze()
-            reward += self.drop_bonus * drop_distance  # Bonus za szybkie upuszczenie
 
-        # Naturalne opadanie
+        # Natural falling
         if not frozen_this_step:
             if not self.collision(self.current_piece, (self.current_pos[0] + 1, self.current_pos[1])):
                 self.current_pos[0] += 1
@@ -241,49 +231,10 @@ class TetrisEnv:
                 frozen_this_step = True
                 cleared = self.freeze()
 
-        # Oblicz nagrody po zamrożeniu klocka
-        if frozen_this_step:
-            # Zwiększona nagroda za usunięte linie
-            if cleared > 0:
-                line_reward = self.line_rewards.get(str(cleared), 0)
-                reward += line_reward * 2.5  # Zwiększona nagroda za linie
-                
-            # Oblicz nowe metryki heurystyczne
-            new_completed_lines = self.get_almost_completed_lines()
-            new_connected_blocks = self.get_connected_blocks()
-            
-            # Nagroda za tworzenie prawie ukończonych linii
-            completed_lines_change = new_completed_lines - old_completed_lines
-            reward += completed_lines_change * 1.2
-            
-            # Nagroda za łączenie bloków
-            connected_blocks_change = new_connected_blocks - old_connected_blocks
-            reward += connected_blocks_change * 0.8
-
-            # Dodatkowe metryki do oceny jakości ruchu
-            new_max_height = self.get_max_height()
-            new_holes = self.get_hole_count()
-            new_bumpiness = self.get_bumpiness()
-            
-            # Zwiększone kary za tworzenie dziur
-            holes_change = new_holes - old_holes
-            reward -= holes_change * 3.0  # Silniejsza kara za dziury
-            
-            # Kara za zwiększenie wysokości
-            height_change = new_max_height - old_max_height
-            reward -= height_change * 0.7
-            
-            # Kara za zwiększenie nierówności
-            bumpiness_change = new_bumpiness - old_bumpiness
-            reward -= bumpiness_change * 0.5
-            
-            # Bonus za niską wysokość przy braku dziur
-            if new_holes == 0 and new_max_height < 8:  # Obniżony próg wysokości
-                reward += 1.0  # Zwiększony bonus
-                
-            # Bonus za równą powierzchnię
-            if new_bumpiness < 2:  # Zaostrzony warunek
-                reward += 0.7  # Zwiększony bonus
+        # Line clearing rewards
+        if frozen_this_step and cleared > 0:
+            line_rewards = {1: 10.0, 2: 30.0, 3: 50.0, 4: 100.0}
+            reward += line_rewards.get(cleared, 0.0)
 
         return self.get_observation(), reward, self.game_over
 

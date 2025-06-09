@@ -33,7 +33,7 @@ class ImprovedTetrisAgent:
         self.target_model.load_state_dict(self.model.state_dict())
         
         # Rest of initialization...
-        self.memory = deque(maxlen=100000)
+        self.memory = deque(maxlen=200000)
         self.batch_size = 128
         self.gamma = 0.99
         self.epsilon = 1.0
