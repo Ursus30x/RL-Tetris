@@ -3,6 +3,7 @@ import torch
 from collections import deque
 from tetris_env import TetrisEnv
 from agent import TetrisGroupedAgent
+from heuristic import TetrisHeuristicAgent
 import time
 import warnings
 import matplotlib.pyplot as plt
@@ -18,7 +19,8 @@ plt.style.use('seaborn-v0_8')
 sns.set_palette("husl")
 
 class TetrisTrainingAnalytics:
-    def __init__(self):
+    def __init__(self, model_name):
+        self.model_name = model_name
         self.episode_rewards = []
         self.episode_lines_cleared = []
         self.episode_moves = []
@@ -48,7 +50,7 @@ class TetrisTrainingAnalytics:
     def plot_training_analytics(self, save_path="training_analytics.png"):
         """Create comprehensive training analytics plots"""
         fig, axes = plt.subplots(3, 3, figsize=(20, 15))
-        fig.suptitle('Tetris DQN Training Analytics', fontsize=16, fontweight='bold')
+        fig.suptitle(f'Tetris {self.model_name} Training Analytics', fontsize=16, fontweight='bold')
         
         # 1. Episode Rewards
         axes[0,0].plot(self.episode_rewards, alpha=0.6, color='blue', linewidth=0.8)
@@ -180,7 +182,7 @@ def normalize_state(obs):
     # Combine both maps into multi-channel representation
     return np.stack([normalized_grid, height_map], axis=0)
 
-def execute_placement_action(env, placement_action):
+def execute_placement_action(env, placement_action, heuristics=False):
     """Execute a placement action (rotation, column) in the environment"""
     if placement_action is None:
         return None, -50.0, True  # Game over penalty
@@ -224,7 +226,7 @@ def execute_placement_action(env, placement_action):
     # Place piece and clear lines
     lines_cleared = env.freeze()
     
-    # Calculate reward based on lines cleared - FIXED VALUES
+    # Unified reward calculation
     reward = 0.0
     if lines_cleared == 1:
         reward = 20.0
@@ -237,7 +239,7 @@ def execute_placement_action(env, placement_action):
     
     return env.get_observation(), reward, env.game_over
 
-def test_trained_model(model_path, num_games=10, render=True):
+def test_trained_model(model_path, num_games=10, render=False):
     """Test a trained model and return performance statistics"""
     print(f"\n{'='*50}")
     print("TESTING TRAINED MODEL")
@@ -359,10 +361,10 @@ def test_trained_model(model_path, num_games=10, render=True):
     
     return test_results
 
-def plot_test_results(test_results, model_path):
+def plot_test_results(test_results, model_name):
     """Create visualization of test results"""
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    fig.suptitle(f'Test Results: {os.path.basename(model_path)}', fontsize=14, fontweight='bold')
+    fig.suptitle(f'Test Results: {os.path.basename(model_name)}', fontsize=14, fontweight='bold')
     
     games = list(range(1, len(test_results['rewards']) + 1))
     
@@ -427,7 +429,7 @@ def train_tetris_agent(episodes=3000, render_every=200, save_every=200, test_dur
     )
     
     # Initialize analytics
-    analytics = TetrisTrainingAnalytics()
+    analytics = TetrisTrainingAnalytics("FP16 Value-based Agent")
     
     # Training metrics
     best_reward = float('-inf')
@@ -609,11 +611,114 @@ def train_tetris_agent(episodes=3000, render_every=200, save_every=200, test_dur
     
     return analytics
 
+def test_heuristic_agent(num_games=10, render=False):
+    """Test the heuristic agent's performance using unified scoring"""
+    print("\nTesting Heuristic Agent...")
+    
+    env = TetrisEnv(render_mode=render)
+    agent = TetrisHeuristicAgent()
+    
+    results = {
+        'rewards': [],
+        'lines_cleared': [],
+        'moves': [],
+        'max_reward': float('-inf'),
+        'min_reward': float('inf'),
+        'total_lines': 0
+    }
+    
+    for game in range(num_games):
+        obs = env.reset()
+        done = False
+        total_reward = 0
+        total_lines_cleared = 0
+        moves_made = 0
+        
+        print(f"\nGame {game + 1}/{num_games}")
+        print("-" * 30)
+        
+        while not done:
+            rotation, col = agent.get_action(env)
+            
+            # Execute the placement
+            for _ in range(rotation):
+                env.current_piece = env.rotate(env.current_piece)
+            env.current_pos[1] = col
+            
+            # Hard drop
+            while not env.collision(env.current_piece, (env.current_pos[0] + 1, env.current_pos[1])):
+                env.current_pos[0] += 1
+            
+            # Freeze piece and get lines cleared
+            lines_cleared = env.freeze()
+            moves_made += 1
+            
+            # Calculate reward based on lines cleared (same as RL agent)
+            reward = 0.0
+            if lines_cleared == 1:
+                reward = 20.0
+            elif lines_cleared == 2:
+                reward = 60.0
+            elif lines_cleared == 3:
+                reward = 200.0
+            elif lines_cleared == 4:
+                reward = 500.0
+            
+            total_reward += reward
+            total_lines_cleared += lines_cleared
+            
+            if render:
+                env.render()
+                #time.sleep(0.05)
+            
+            done = env.game_over
+            
+            if lines_cleared > 0:
+                print(f"  Lines cleared: {lines_cleared} (Total: {total_lines_cleared})")
+        
+        # Store results
+        results['rewards'].append(total_reward)
+        results['lines_cleared'].append(total_lines_cleared)
+        results['moves'].append(moves_made)
+        results['total_lines'] += total_lines_cleared
+        results['max_reward'] = max(results['max_reward'], total_reward)
+        results['min_reward'] = min(results['min_reward'], total_reward)
+        
+        print(f"  Final Score: {total_reward:.1f}")
+        print(f"  Lines Cleared: {total_lines_cleared}")
+        print(f"  Moves Made: {moves_made}")
+        print(f"  Efficiency: {total_lines_cleared/moves_made:.3f} lines/move" if moves_made > 0 else "  Efficiency: 0.000")
+    
+    env.close()
+    
+    # Calculate statistics
+    avg_reward = np.mean(results['rewards'])
+    std_reward = np.std(results['rewards'])
+    avg_lines = np.mean(results['lines_cleared'])
+    avg_moves = np.mean(results['moves'])
+    
+    print(f"\n{'='*50}")
+    print("HEURISTIC AGENT RESULTS SUMMARY")
+    print(f"{'='*50}")
+    print(f"Average Reward: {avg_reward:.1f} ± {std_reward:.1f}")
+    print(f"Best Game: {results['max_reward']:.1f}")
+    print(f"Worst Game: {results['min_reward']:.1f}")
+    print(f"Average Lines Cleared: {avg_lines:.1f}")
+    print(f"Total Lines Cleared: {results['total_lines']}")
+    print(f"Average Moves per Game: {avg_moves:.1f}")
+    print(f"Overall Efficiency: {results['total_lines']/(sum(results['moves'])):.3f} lines/move")
+    print(f"{'='*50}")
+    
+    # Create test results visualization
+    plot_test_results(results, "heuristic_agent")
+    
+    return results
+
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Tetris DQN Training and Testing')
-    parser.add_argument('--mode', choices=['train', 'test', 'both'], default='both',
+    parser = argparse.ArgumentParser(description='Tetris Training and Testing')
+    parser.add_argument('--mode', choices=['train', 'test', 'both', 'heuristic'], default='both',
                        help='Mode: train, test, or both')
     parser.add_argument('--episodes', type=int, default=3000,
                        help='Number of training episodes')
@@ -630,10 +735,14 @@ if __name__ == "__main__":
         analytics = train_tetris_agent(episodes=args.episodes)
     elif args.mode == 'test':
         test_trained_model(args.model_path, num_games=args.test_games, render=args.render)
-    else:  # both
+    elif args.mode == 'heuristic':
+        test_heuristic_agent(render=args.render)
+    elif args.mode == 'both':  # both
         print("🚀 Starting training phase...")
         analytics = train_tetris_agent(episodes=args.episodes)
         
         print("\n🎮 Starting testing phase...")
         test_trained_model("best_grouped_tetris_model.pth", 
                           num_games=args.test_games, render=args.render)
+    else:
+        print("no args")

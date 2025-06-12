@@ -50,7 +50,7 @@ if __name__ == "__main__":
         # Test prostego importu
         try:
             from tetris_env import TetrisEnv
-            from agent import ImprovedTetrisAgent
+            from valueAgent import ImprovedTetrisAgent
             print("✓ Moduły projektu importują się poprawnie")
         except Exception as e:
             print(f"✗ Problem z importem modułów projektu: {e}")

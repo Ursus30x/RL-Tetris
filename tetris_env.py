@@ -91,39 +91,69 @@ class TetrisEnv:
         self.current_piece = np.array(SHAPES[shape_id])
         self.current_pos = [0, GRID_WIDTH // 2 - len(self.current_piece[0]) // 2]
         
+        # Immediate game over if we can't place the piece at all
         if self.collision(self.current_piece, self.current_pos):
             self.game_over = True
+            self.current_piece = None  # Clear current piece
+            return False
+        
+        # Additional check for any overlap with existing blocks
+        for y in range(self.current_piece.shape[0]):
+            for x in range(self.current_piece.shape[1]):
+                if (self.current_piece[y][x] and 
+                    y + self.current_pos[0] >= 0 and 
+                    self.grid[y + self.current_pos[0]][x + self.current_pos[1]]):
+                    self.game_over = True
+                    self.current_piece = None
+                    return False
+        return True
 
     def collision(self, piece, pos):
         """Check if piece collides with grid boundaries or existing blocks"""
         px, py = pos
         for y in range(piece.shape[0]):
             for x in range(piece.shape[1]):
-                if piece[y][x] and (
-                        y + px >= GRID_HEIGHT or
-                        x + py < 0 or
-                        x + py >= GRID_WIDTH or
-                        (y + px >= 0 and self.grid[y + px][x + py])
-                ):
-                    return True
+                if piece[y][x]:  # Only check where the piece exists
+                    # Calculate board position
+                    board_y = y + px
+                    board_x = x + py
+                    
+                    # Check grid boundaries
+                    if (board_y >= GRID_HEIGHT or  # Bottom
+                        board_x < 0 or             # Left
+                        board_x >= GRID_WIDTH):    # Right
+                        return True
+                    
+                    # Check if position is occupied (and within grid top)
+                    if board_y >= 0 and self.grid[board_y][board_x]:
+                        return True
         return False
 
     def freeze(self):
         """Fix current piece into the grid and clear completed lines"""
+        if self.current_piece is None:
+            return 0
+        
         px, py = self.current_pos
         
-        # Place piece in grid
-        for i, row in enumerate(self.current_piece):
-            for j, cell in enumerate(row):
-                if cell:
-                    if px + i >= 0:  # Only place if within grid
-                        self.grid[px + i][py + j] = 1
+        # Place piece in grid only if position is valid
+        if not self.collision(self.current_piece, self.current_pos):
+            for i, row in enumerate(self.current_piece):
+                for j, cell in enumerate(row):
+                    if cell:
+                        if px + i >= 0:  # Only place if within grid
+                            self.grid[px + i][py + j] = cell
+        else:
+            # If we can't place the piece, game over
+            self.game_over = True
+            return 0
         
         # Clear completed lines
         lines_cleared = self.clear_lines()
         
         # Spawn next piece
-        self.spawn_piece()
+        if not self.spawn_piece():
+            self.game_over = True
         
         return lines_cleared
 
@@ -155,48 +185,68 @@ class TetrisEnv:
 
     def get_observation(self):
         """Get current game state observation"""
+        # Create a safe copy of the grid
+        grid_copy = self.grid.copy()
+        
+        # Handle current_piece safely
+        current_piece_copy = None
+        if self.current_piece is not None:
+            current_piece_copy = self.current_piece.copy()
+        
+        # Handle current_pos safely
+        current_pos_copy = None
+        if self.current_pos is not None:
+            current_pos_copy = tuple(self.current_pos)
+        
         return {
-            "grid": self.grid.copy(),
-            "current_piece": self.current_piece.copy(),
-            "current_pos": tuple(self.current_pos)
+            "grid": grid_copy,
+            "current_piece": current_piece_copy,
+            "current_pos": current_pos_copy
         }
 
     def step(self, action):
         """Execute one game step with given action"""
-        if self.game_over:
+        if self.game_over or self.current_piece is None:
             return self.get_observation(), self.death_penalty, True
-
+        
         reward = 0.0
         frozen_this_step = False
         cleared = 0
 
-        # Execute action
-        px, py = self.current_pos
-        if action == 0 and not self.collision(self.current_piece, (px, py - 1)):  # Left
-            self.current_pos[1] -= 1
-        elif action == 1 and not self.collision(self.current_piece, (px, py + 1)):  # Right
-            self.current_pos[1] += 1
-        elif action == 2:  # Rotate
-            rotated = self.rotate(self.current_piece)
-            if not self.collision(rotated, self.current_pos):
-                self.current_piece = rotated
-        elif action == 3:  # Hard drop
-            while not self.collision(self.current_piece, (self.current_pos[0] + 1, self.current_pos[1])):
-                self.current_pos[0] += 1
-            frozen_this_step = True
-            cleared = self.freeze()
+        # Execute action only if game is still active
+        if not self.game_over:
+            px, py = self.current_pos
+            if action == 0 and not self.collision(self.current_piece, (px, py - 1)):  # Left
+                self.current_pos[1] -= 1
+            elif action == 1 and not self.collision(self.current_piece, (px, py + 1)):  # Right
+                self.current_pos[1] += 1
+            elif action == 2:  # Rotate
+                rotated = self.rotate(self.current_piece)
+                if not self.collision(rotated, self.current_pos):
+                    self.current_piece = rotated
+            elif action == 3:  # Hard drop
+                while not self.collision(self.current_piece, (self.current_pos[0] + 1, self.current_pos[1])):
+                    self.current_pos[0] += 1
+                frozen_this_step = True
+                cleared = self.freeze()
 
         # Natural falling (gravity)
-        if not frozen_this_step:
+        if not frozen_this_step and not self.game_over:
             if not self.collision(self.current_piece, (self.current_pos[0] + 1, self.current_pos[1])):
                 self.current_pos[0] += 1
             else:
-                frozen_this_step = True
                 cleared = self.freeze()
 
         # Calculate reward for line clears
         if cleared > 0:
-            reward += int(self.line_rewards.get(str(cleared), 0))
+            if cleared == 1:
+                reward = 20.0
+            elif cleared == 2:
+                reward = 60.0
+            elif cleared == 3:
+                reward = 200.0
+            elif cleared == 4:
+                reward = 500.0
 
         return self.get_observation(), reward, self.game_over
 
@@ -251,7 +301,8 @@ class TetrisEnv:
         self.grid = np.zeros((GRID_HEIGHT, GRID_WIDTH), dtype=int)
         self.score = 0
         self.game_over = False
-        self.spawn_piece()
+        if not self.spawn_piece():
+            self.game_over = True
         return self.get_observation()
 
     def close(self):

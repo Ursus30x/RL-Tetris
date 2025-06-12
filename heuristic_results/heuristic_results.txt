@@ -1,0 +1,11 @@
+==================================================
+HEURISTIC AGENT RESULTS SUMMARY
+==================================================
+Average Reward: 4764.0 ± 3779.6
+Best Game: 12420.0
+Worst Game: 620.0
+Average Lines Cleared: 198.1
+Total Lines Cleared: 1981
+Average Moves per Game: 526.3
+Overall Efficiency: 0.376 lines/move
+==================================================
