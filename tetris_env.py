@@ -13,25 +13,25 @@ FPS = 100
 
 # Colors
 COLORS = [
-    (0, 0, 0),  # Empty
+    (0, 0, 0),      # Empty
     (0, 255, 255),  # I
-    (0, 0, 255),  # J
+    (0, 0, 255),    # J
     (255, 165, 0),  # L
     (255, 255, 0),  # O
-    (0, 255, 0),  # S
+    (0, 255, 0),    # S
     (128, 0, 128),  # T
-    (255, 0, 0),  # Z
+    (255, 0, 0),    # Z
 ]
 
 # Tetrimino shapes
 SHAPES = [
-    [[1, 1, 1, 1]],  # I
-    [[2, 0, 0], [2, 2, 2]],  # J
-    [[0, 0, 3], [3, 3, 3]],  # L
-    [[4, 4], [4, 4]],  # O
-    [[0, 5, 5], [5, 5, 0]],  # S
-    [[0, 6, 0], [6, 6, 6]],  # T
-    [[7, 7, 0], [0, 7, 7]],  # Z
+    [[1, 1, 1, 1]],              # I
+    [[2, 0, 0], [2, 2, 2]],      # J
+    [[0, 0, 3], [3, 3, 3]],      # L
+    [[4, 4], [4, 4]],            # O
+    [[0, 5, 5], [5, 5, 0]],      # S
+    [[0, 6, 0], [6, 6, 6]],      # T
+    [[7, 7, 0], [0, 7, 7]],      # Z
 ]
 
 
@@ -39,13 +39,10 @@ class TetrisEnv:
     def __init__(self, render_mode=False, config_path="config.json"):
         # Load config
         self.reward_config = self.load_config(config_path)
-
-        # Example:
-        self.step_penalty = self.reward_config.get("step_penalty", -0.1)
-        self.drop_bonus = self.reward_config.get("drop_bonus", 0.1)
-        self.death_penalty = self.reward_config.get("death_penalty", -1.0)
+        self.death_penalty = self.reward_config.get("death_penalty", -100.0)
         self.line_rewards = self.reward_config.get("line_rewards", {"1": 40, "2": 100, "3": 300, "4": 1200})
 
+        # Game state
         self.grid = np.zeros((GRID_HEIGHT, GRID_WIDTH), dtype=int)
         self.score = 0
         self.game_over = False
@@ -55,14 +52,13 @@ class TetrisEnv:
         self.current_pos = None
         self.spawn_piece()
 
+        # Pygame initialization for rendering
         if self.render_mode:
-            # Windows-specific pygame initialization
             if sys.platform.startswith('win'):
                 os.environ['SDL_VIDEODRIVER'] = 'windib'
 
             pygame.init()
             pygame.display.init()
-
             self.screen = pygame.display.set_mode((GRID_WIDTH * BLOCK_SIZE, GRID_HEIGHT * BLOCK_SIZE))
             pygame.display.set_caption("Tetris RL")
 
@@ -73,8 +69,8 @@ class TetrisEnv:
                 self.clock = None
 
     def load_config(self, path):
+        """Load configuration from JSON file"""
         try:
-            # Używaj ścieżki względnej do pliku
             if not os.path.isabs(path):
                 script_dir = os.path.dirname(os.path.abspath(__file__))
                 path = os.path.join(script_dir, path)
@@ -90,13 +86,16 @@ class TetrisEnv:
             return {}
 
     def spawn_piece(self):
+        """Spawn a new random piece at the top"""
         shape_id = random.randint(0, len(SHAPES) - 1)
         self.current_piece = np.array(SHAPES[shape_id])
         self.current_pos = [0, GRID_WIDTH // 2 - len(self.current_piece[0]) // 2]
+        
         if self.collision(self.current_piece, self.current_pos):
             self.game_over = True
 
     def collision(self, piece, pos):
+        """Check if piece collides with grid boundaries or existing blocks"""
         px, py = pos
         for y in range(piece.shape[0]):
             for x in range(piece.shape[1]):
@@ -104,104 +103,70 @@ class TetrisEnv:
                         y + px >= GRID_HEIGHT or
                         x + py < 0 or
                         x + py >= GRID_WIDTH or
-                        self.grid[y + px][x + py]
+                        (y + px >= 0 and self.grid[y + px][x + py])
                 ):
                     return True
         return False
 
     def freeze(self):
-        """Fix current piece into the grid and check for line clears"""
+        """Fix current piece into the grid and clear completed lines"""
         px, py = self.current_pos
+        
+        # Place piece in grid
         for i, row in enumerate(self.current_piece):
             for j, cell in enumerate(row):
                 if cell:
-                    self.grid[px + i][py + j] = 1
+                    if px + i >= 0:  # Only place if within grid
+                        self.grid[px + i][py + j] = 1
+        
+        # Clear completed lines
         lines_cleared = self.clear_lines()
+        
+        # Spawn next piece
         self.spawn_piece()
-
+        
         return lines_cleared
 
     def clear_lines(self):
-        # Keep only rows that are NOT fully filled (not all True/non-zero)
-        new_grid = [row for row in self.grid if not np.all(row)]
-
-        lines_cleared = GRID_HEIGHT - len(new_grid)
-
-        if lines_cleared > 0:
-            self.score += lines_cleared
-
-            # Create empty rows at the top for cleared lines
-            empty_rows = np.zeros((lines_cleared, GRID_WIDTH), dtype=int)
-
-            # Stack empty rows above the remaining grid rows
-            self.grid = np.vstack((empty_rows, np.array(new_grid)))
-
+        """Clear completed lines and return number of lines cleared"""
+        # Find incomplete rows
+        new_grid = []
+        lines_cleared = 0
+        
+        for row in self.grid:
+            if not np.all(row):  # Row is not completely filled
+                new_grid.append(row.copy())
+            else:
+                lines_cleared += 1
+        
+        # Add empty rows at the top
+        while len(new_grid) < GRID_HEIGHT:
+            new_grid.insert(0, np.zeros(GRID_WIDTH, dtype=int))
+        
+        # Update grid and score
+        self.grid = np.array(new_grid)
+        self.score += lines_cleared
+        
         return lines_cleared
 
     def rotate(self, piece):
+        """Rotate piece 90 degrees clockwise"""
         return np.rot90(piece, -1)
 
-    def line_clear_reward(self, lines_cleared):
-        return self.line_rewards.get(str(lines_cleared), 0)
-
-    def get_max_height(self):
-        # Assuming self.grid is 2D numpy array with 0 = empty, >0 = block
-        for row in range(self.grid.shape[0]):
-            if np.any(self.grid[row, :] != 0):
-                return self.grid.shape[0] - row  # Height counted from bottom
-        return 0
-
-    def get_hole_count(self):
-        holes = 0
-        grid = self.grid
-        for col in range(grid.shape[1]):
-            column = grid[:, col]
-            filled_found = False
-            for cell in column:
-                if cell != 0:
-                    filled_found = True
-                elif filled_found and cell == 0:
-                    holes += 1
-        return holes
-
     def get_observation(self):
-        obs = {
+        """Get current game state observation"""
+        return {
             "grid": self.grid.copy(),
             "current_piece": self.current_piece.copy(),
             "current_pos": tuple(self.current_pos)
         }
-        return obs
-
-
-    def get_bumpiness(self):
-        """Oblicz nierówność powierzchni - różnice wysokości między sąsiednimi kolumnami"""
-        heights = []
-        for col in range(self.grid.shape[1]):
-            height = 0
-            for row in range(self.grid.shape[0]):
-                if self.grid[row, col] != 0:
-                    height = self.grid.shape[0] - row
-                    break
-            heights.append(height)
-        
-        bumpiness = sum(abs(heights[i] - heights[i+1]) for i in range(len(heights)-1))
-        return bumpiness
-
-    def get_aggregate_height(self):
-        """Suma wysokości wszystkich kolumn"""
-        total_height = 0
-        for col in range(self.grid.shape[1]):
-            for row in range(self.grid.shape[0]):
-                if self.grid[row, col] != 0:
-                    total_height += self.grid.shape[0] - row
-                    break
-        return total_height
 
     def step(self, action):
+        """Execute one game step with given action"""
         if self.game_over:
-            return self.get_observation(), -2.0, True  # Game over penalty
+            return self.get_observation(), self.death_penalty, True
 
-        reward = 1.0  # Small positive reward for each step
+        reward = 0.0
         frozen_this_step = False
         cleared = 0
 
@@ -216,14 +181,12 @@ class TetrisEnv:
             if not self.collision(rotated, self.current_pos):
                 self.current_piece = rotated
         elif action == 3:  # Hard drop
-            drop_distance = 0
             while not self.collision(self.current_piece, (self.current_pos[0] + 1, self.current_pos[1])):
                 self.current_pos[0] += 1
-                drop_distance += 1
             frozen_this_step = True
             cleared = self.freeze()
 
-        # Natural falling
+        # Natural falling (gravity)
         if not frozen_this_step:
             if not self.collision(self.current_piece, (self.current_pos[0] + 1, self.current_pos[1])):
                 self.current_pos[0] += 1
@@ -231,65 +194,49 @@ class TetrisEnv:
                 frozen_this_step = True
                 cleared = self.freeze()
 
-        # Line clearing rewards
-        if frozen_this_step and cleared > 0:
-            line_rewards = {1: 10.0, 2: 30.0, 3: 50.0, 4: 100.0}
-            reward += line_rewards.get(cleared, 0.0)
+        # Calculate reward for line clears
+        if cleared > 0:
+            reward += int(self.line_rewards.get(str(cleared), 0))
 
         return self.get_observation(), reward, self.game_over
 
-    # Dodane nowe funkcje pomocnicze
-    def get_almost_completed_lines(self):
-        """Zlicza linie, w których brakuje tylko 1-2 bloków do ukończenia"""
-        count = 0
-        for row in range(self.grid.shape[0]):
-            if 1 <= np.count_nonzero(self.grid[row] == 0) <= 2:
-                count += 1
-        return count
-
-    def get_connected_blocks(self):
-        """Zlicza bloki, które mają sąsiadów w poziomie lub pionie"""
-        connected = 0
-        for y in range(self.grid.shape[0]):
-            for x in range(self.grid.shape[1]):
-                if self.grid[y][x] != 0:
-                    # Sprawdź sąsiadów: lewy, prawy, dolny
-                    neighbors = 0
-                    if x > 0 and self.grid[y][x-1] != 0:
-                        neighbors += 1
-                    if x < self.grid.shape[1]-1 and self.grid[y][x+1] != 0:
-                        neighbors += 1
-                    if y < self.grid.shape[0]-1 and self.grid[y+1][x] != 0:
-                        neighbors += 1
-                    
-                    if neighbors >= 2:  # Blok z co najmniej 2 sąsiadami
-                        connected += 1
-        return connected
-
     def render(self):
+        """Render the game using pygame"""
         if not self.render_mode:
             return
 
         try:
             self.screen.fill((0, 0, 0))
 
+            # Draw grid
             for y in range(GRID_HEIGHT):
                 for x in range(GRID_WIDTH):
                     val = self.grid[y][x]
-                    pygame.draw.rect(self.screen, COLORS[val], (x * BLOCK_SIZE, y * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE),
-                                     0)
+                    color = COLORS[val] if val < len(COLORS) else COLORS[0]
+                    pygame.draw.rect(
+                        self.screen, 
+                        color, 
+                        (x * BLOCK_SIZE, y * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE), 
+                        0
+                    )
 
             # Draw current piece
-            px, py = self.current_pos
-            for y in range(self.current_piece.shape[0]):
-                for x in range(self.current_piece.shape[1]):
-                    if self.current_piece[y][x]:
-                        pygame.draw.rect(
-                            self.screen,
-                            COLORS[self.current_piece[y][x]],
-                            ((py + x) * BLOCK_SIZE, (px + y) * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE),
-                            0
-                        )
+            if self.current_piece is not None:
+                px, py = self.current_pos
+                for y in range(self.current_piece.shape[0]):
+                    for x in range(self.current_piece.shape[1]):
+                        if self.current_piece[y][x]:
+                            screen_x = (py + x) * BLOCK_SIZE
+                            screen_y = (px + y) * BLOCK_SIZE
+                            if screen_y >= 0:  # Only draw if visible
+                                color_idx = self.current_piece[y][x]
+                                color = COLORS[color_idx] if color_idx < len(COLORS) else COLORS[1]
+                                pygame.draw.rect(
+                                    self.screen,
+                                    color,
+                                    (screen_x, screen_y, BLOCK_SIZE, BLOCK_SIZE),
+                                    0
+                                )
 
             pygame.display.flip()
 
@@ -300,6 +247,7 @@ class TetrisEnv:
             print(f"Render error: {e}")
 
     def reset(self):
+        """Reset the game to initial state"""
         self.grid = np.zeros((GRID_HEIGHT, GRID_WIDTH), dtype=int)
         self.score = 0
         self.game_over = False
@@ -307,6 +255,7 @@ class TetrisEnv:
         return self.get_observation()
 
     def close(self):
+        """Clean up pygame resources"""
         if self.render_mode:
             try:
                 pygame.quit()
@@ -315,14 +264,7 @@ class TetrisEnv:
 
 
 def get_user_action():
-    """
-    Maps arrow key presses to action codes:
-    0 - left
-    1 - right
-    2 - rotate (up)
-    3 - drop (down)
-    4 - do nothing
-    """
+    """Get user input for manual play"""
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             return 'quit'
@@ -339,11 +281,12 @@ def get_user_action():
 
 
 if __name__ == "__main__":
+    # Manual play mode
     env = TetrisEnv(render_mode=True)
     obs = env.reset()
     done = False
 
-    print("Sterowanie: Strzałki - ruch, ESC - wyjście")
+    print("Controls: Arrow keys for movement, ESC to quit")
 
     while not done:
         action = get_user_action()
@@ -351,5 +294,8 @@ if __name__ == "__main__":
             break
         obs, reward, done = env.step(action)
         env.render()
+        
+        if reward > 0:
+            print(f"Lines cleared! Reward: {reward}")
 
     env.close()
