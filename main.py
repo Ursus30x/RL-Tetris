@@ -31,7 +31,7 @@ def normalize_state(obs):
 def execute_placement_action(env, placement_action):
     """Execute a placement action (rotation, column) in the environment"""
     if placement_action is None:
-        return None, -100.0, True  # Game over
+        return None, -50.0, True  # Game over
     
     rotation, target_col = placement_action
     

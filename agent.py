@@ -24,21 +24,30 @@ class TetrisGroupedAgent:
         self.target_model = TetrisValueNet(self.state_shape[0]).to(self.device)
         self.target_model.load_state_dict(self.model.state_dict())
         
-        # Training parameters
-        self.memory = deque(maxlen=100000)  # Smaller buffer since each transition is more meaningful
-        self.batch_size = 64
-        self.gamma = 0.99
-        self.epsilon = 0.1  # Much lower epsilon for exploration
+        # Improved training parameters
+        self.memory = deque(maxlen=50000)  # Smaller buffer
+        self.batch_size = 32  # Smaller batch size for more stable gradients
+        self.gamma = 0.95  # Lower gamma for shorter episode horizon
+        self.epsilon = 0.1
         self.epsilon_min = 0.01
-        self.epsilon_decay = 0.999
-        self.tau = 0.005
+        self.epsilon_decay = 0.9995  # Slower decay
+        self.tau = 0.001  # Slower target network updates
         
         self.steps = 0
         self.recent_rewards = deque(maxlen=100)
         self.training_stats = {'losses': [], 'values': []}
         
         self.scaler = GradScaler(enabled=use_amp)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=5e-4, weight_decay=1e-4)
+        # Lower learning rate and add learning rate scheduler
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), 
+                                        lr=1e-4, 
+                                        weight_decay=1e-5,
+                                        betas=(0.9, 0.999))
+        
+        # Add learning rate scheduler
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.8, patience=50
+        )
 
     def generate_possible_placements(self, board, piece):
         """Generate all valid (rotation, column) placements for current piece"""
@@ -208,13 +217,13 @@ class TetrisGroupedAgent:
         if lines_cleared == 0:
             return 0.0
         elif lines_cleared == 1:
-            return 40.0
+            return 20
         elif lines_cleared == 2:
-            return 100.0
+            return 60
         elif lines_cleared == 3:
-            return 300.0
+            return 200
         elif lines_cleared == 4:
-            return 1200.0  # Tetris!
+            return 500  # Tetris!
         else:
             return 0.0
 
@@ -231,11 +240,18 @@ class TetrisGroupedAgent:
         transitions = random.sample(self.memory, self.batch_size)
         batch = Transition(*zip(*transitions))
         
-        # Convert to tensors
+        # Convert to tensors - handle None states properly
         state_batch = torch.cat(batch.state).to(self.device)
         reward_batch = torch.tensor(batch.reward, device=self.device, dtype=torch.float32)
-        next_state_batch = torch.cat([s for s in batch.next_state if s is not None]).to(self.device)
         done_batch = torch.tensor(batch.done, device=self.device, dtype=torch.float32)
+        
+        # Handle next states (some might be None for terminal states)
+        non_final_mask = torch.tensor([s is not None for s in batch.next_state], 
+                                    device=self.device, dtype=torch.bool)
+        non_final_next_states = torch.cat([s for s in batch.next_state if s is not None]).to(self.device)
+        
+        # Normalize rewards to prevent large gradients
+        reward_batch = reward_batch / 100.0  # Scale down rewards
         
         # Compute values and loss with mixed precision
         with torch.amp.autocast('cuda' if torch.cuda.is_available() else 'cpu', enabled=self.use_amp):
@@ -243,19 +259,25 @@ class TetrisGroupedAgent:
             current_values = self.model(state_batch).squeeze()
             
             # Target values
+            next_state_values = torch.zeros(self.batch_size, device=self.device)
             with torch.no_grad():
-                next_values = self.target_model(next_state_batch).squeeze()
-                target_values = reward_batch + (1 - done_batch) * self.gamma * next_values
+                if len(non_final_next_states) > 0:
+                    next_vals = self.target_model(non_final_next_states).squeeze()
+                    next_state_values[non_final_mask] = next_vals.float()
             
-            # Compute loss
-            loss = F.mse_loss(current_values, target_values)
+            # Compute target values with clipping to prevent exploding targets
+            target_values = reward_batch + (1 - done_batch) * self.gamma * next_state_values
+            target_values = torch.clamp(target_values, -10.0, 10.0)  # Clip targets
+            
+            # Compute Huber loss instead of MSE for more stable training
+            loss = F.smooth_l1_loss(current_values, target_values)
         
         # Backpropagation with gradient scaling
         self.optimizer.zero_grad()
         self.scaler.scale(loss).backward()
         
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        # More aggressive gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
         
         # Update weights
         self.scaler.step(self.optimizer)
@@ -273,6 +295,10 @@ class TetrisGroupedAgent:
         self.training_stats['losses'].append(loss.item())
         avg_value = current_values.mean().item()
         self.training_stats['values'].append(avg_value)
+
+        if len(self.training_stats['losses']) % 100 == 0:
+            avg_loss = np.mean(self.training_stats['losses'][-100:])
+            self.scheduler.step(avg_loss)
         
         return loss.item()
 
