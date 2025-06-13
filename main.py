@@ -237,7 +237,7 @@ def plot_test_results(test_results, model_path):
     print(f"Test results visualization saved to {save_path}")
 
 # Main training loop
-def train_tetris_agent(episodes=2000, render_every=500, save_every=100, eval_every=100):
+def train_tetris_agent(episodes=2000, render_every=500, save_every=200, eval_every=100):
     env = TetrisEnv(render_mode=False)  # Wyłącz rendering dla szybszego treningu
     n_frames = 4
     state_shape = (n_frames * 2, 20, 10)  # 2 kanały * 4 klatki
@@ -384,4 +384,4 @@ def train_tetris_agent(episodes=2000, render_every=500, save_every=100, eval_eve
     print("="*50)
 
 if __name__ == "__main__":
-    train_tetris_agent(episodes=300)
+    train_tetris_agent(episodes=3000)
