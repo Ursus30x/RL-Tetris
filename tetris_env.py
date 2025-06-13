@@ -50,6 +50,7 @@ class TetrisEnv:
 
         self.current_piece = None
         self.current_pos = None
+        self.next_piece = np.array(SHAPES[random.randint(0, len(SHAPES) - 1)])  # Add this line
         self.spawn_piece()
 
         # Pygame initialization for rendering
@@ -67,6 +68,61 @@ class TetrisEnv:
             except pygame.error as e:
                 print(f"Warning: Clock initialization failed: {e}")
                 self.clock = None
+
+    def get_next_piece(self):
+        """Get the next piece that will appear after the current one"""
+        return self.next_piece.copy() if self.next_piece is not None else np.array(SHAPES[random.randint(0, len(SHAPES) - 1)])
+
+    def simulate_placement(self, piece, rotation, column):
+        """
+        Simulate placing a piece at a specific rotation and column
+        Returns the resulting grid and lines cleared
+        """
+        # Create a copy of the current grid
+        grid_copy = self.grid.copy()
+        
+        # Rotate the piece
+        rotated_piece = np.rot90(piece, -rotation)
+        
+        # Find drop position
+        drop_row = 0
+        while not self._collision_at_pos(rotated_piece, (drop_row + 1, column), grid_copy):
+            drop_row += 1
+        
+        # Place the piece
+        for y in range(rotated_piece.shape[0]):
+            for x in range(rotated_piece.shape[1]):
+                if rotated_piece[y][x]:
+                    grid_copy[y + drop_row][x + column] = rotated_piece[y][x]
+        
+        # Clear lines
+        lines_cleared = 0
+        new_grid = []
+        for row in grid_copy:
+            if not np.all(row):
+                new_grid.append(row.copy())
+            else:
+                lines_cleared += 1
+        
+        # Add empty rows at the top
+        while len(new_grid) < GRID_HEIGHT:
+            new_grid.insert(0, np.zeros(GRID_WIDTH, dtype=int))
+        
+        return np.array(new_grid), lines_cleared
+
+    def _collision_at_pos(self, piece, pos, grid):
+        """Check collision at specific position on a grid"""
+        px, py = pos
+        for y in range(piece.shape[0]):
+            for x in range(piece.shape[1]):
+                if piece[y][x] and (
+                    y + px >= GRID_HEIGHT or
+                    x + py < 0 or
+                    x + py >= GRID_WIDTH or
+                    (y + px >= 0 and grid[y + px][x + py])
+                ):
+                    return True
+        return False
 
     def load_config(self, path):
         """Load configuration from JSON file"""
@@ -87,10 +143,10 @@ class TetrisEnv:
 
     def spawn_piece(self):
         """Spawn a new random piece at the top"""
-        shape_id = random.randint(0, len(SHAPES) - 1)
-        self.current_piece = np.array(SHAPES[shape_id])
+        self.current_piece = self.next_piece  # Use the next piece
         self.current_pos = [0, GRID_WIDTH // 2 - len(self.current_piece[0]) // 2]
-        
+        self.next_piece = np.array(SHAPES[random.randint(0, len(SHAPES) - 1)])  # Prepare the next piece
+
         if self.collision(self.current_piece, self.current_pos):
             self.game_over = True
 

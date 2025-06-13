@@ -1,639 +1,590 @@
-import numpy as np
-import torch
-from collections import deque
-from tetris_env import TetrisEnv
-from agent import TetrisGroupedAgent
-import time
-import warnings
-import matplotlib.pyplot as plt
-import seaborn as sns
-from datetime import datetime
 import os
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import deque
+import torch
+import json
+from datetime import datetime
+import argparse
+import signal
+import sys
 
-# Suppress PyTorch warnings
-warnings.filterwarnings("ignore", category=UserWarning)
+from agent import TetrisVisualAgent
+from screenshots_utils import ScreenshotProcessor, FrameBuffer
+from tetris_env import TetrisEnv
 
-# Set style for plots
-plt.style.use('seaborn-v0_8')
-sns.set_palette("husl")
 
-class TetrisTrainingAnalytics:
-    def __init__(self):
-        self.episode_rewards = []
-        self.episode_lines_cleared = []
-        self.episode_moves = []
-        self.episode_durations = []
-        self.losses = []
-        self.epsilon_history = []
-        self.learning_rates = []
-        self.avg_rewards_window = []
-        self.best_rewards = []
-        self.memory_sizes = []
-        self.value_estimates = []
+class VisualTetrisTrainer:
+    """
+    Main training class for visual Tetris RL agent
+    """
+    
+    def __init__(self, config_path="training_config.json"):
+        """Initialize trainer with configuration"""
+        self.config = self.load_config(config_path)
+        self.setup_directories()
+        self.setup_training_params()
+        self.setup_components()
+        self.setup_tracking()
         
-    def update(self, episode, reward, lines_cleared, moves, duration, loss, epsilon, lr, avg_reward, memory_size, avg_value):
-        self.episode_rewards.append(reward)
-        self.episode_lines_cleared.append(lines_cleared)
-        self.episode_moves.append(moves)
-        self.episode_durations.append(duration)
-        if loss is not None:
-            self.losses.append(loss)
-        self.epsilon_history.append(epsilon)
-        self.learning_rates.append(lr)
-        self.avg_rewards_window.append(avg_reward)
-        self.memory_sizes.append(memory_size)
-        if avg_value is not None:
-            self.value_estimates.append(avg_value)
+        # Setup graceful shutdown
+        signal.signal(signal.SIGINT, self.signal_handler)
+        self.shutdown_requested = False
     
-    def plot_training_analytics(self, save_path="training_analytics.png"):
-        """Create comprehensive training analytics plots"""
-        fig, axes = plt.subplots(3, 3, figsize=(20, 15))
-        fig.suptitle('Tetris DQN Training Analytics', fontsize=16, fontweight='bold')
+    def load_config(self, config_path):
+        """Load training configuration"""
+        default_config = {
+            "training": {
+                "episodes": 10000,
+                "max_steps_per_episode": 1000,
+                "save_interval": 100,
+                "eval_interval": 50,
+                "eval_episodes": 5,
+                "render_training": False,
+                "render_evaluation": True
+            },
+            "agent": {
+                "input_shape": [4, 84, 84],
+                "num_actions": 4,
+                "use_amp": True,
+                "learning_rate": 0.00025,
+                "batch_size": 32,
+                "memory_size": 100000,
+                "epsilon_start": 1.0,
+                "epsilon_end": 0.01,
+                "epsilon_decay": 0.995,
+                "target_update_freq": 1000,
+                "training_start": 1000
+            },
+            "preprocessing": {
+                "target_size": [84, 84],
+                "grayscale": True,
+                "frame_stack": 4
+            },
+            "rewards": {
+                "line_clear_multiplier": 1.0,
+                "survival_bonus": 0.1,
+                "height_penalty": -0.01
+            },
+            "logging": {
+                "log_interval": 10,
+                "plot_interval": 100,
+                "save_plots": True
+            }
+        }
         
-        # 1. Episode Rewards
-        axes[0,0].plot(self.episode_rewards, alpha=0.6, color='blue', linewidth=0.8)
-        if len(self.avg_rewards_window) > 0:
-            axes[0,0].plot(self.avg_rewards_window, color='red', linewidth=2, label='Moving Average (100)')
-        axes[0,0].set_title('Episode Rewards')
-        axes[0,0].set_xlabel('Episode')
-        axes[0,0].set_ylabel('Total Reward')
-        axes[0,0].grid(True, alpha=0.3)
-        axes[0,0].legend()
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    user_config = json.load(f)
+                # Merge configurations
+                self.merge_config(default_config, user_config)
+            except Exception as e:
+                print(f"Error loading config: {e}. Using defaults.")
+        else:
+            print(f"Config file {config_path} not found. Using defaults.")
+            # Create default config file
+            with open(config_path, 'w') as f:
+                json.dump(default_config, f, indent=4)
         
-        # 2. Lines Cleared
-        axes[0,1].plot(self.episode_lines_cleared, color='green', alpha=0.7)
-        if len(self.episode_lines_cleared) > 100:
-            # Moving average for lines cleared
-            window = 50
-            lines_ma = [np.mean(self.episode_lines_cleared[max(0, i-window):i+1]) 
-                       for i in range(window, len(self.episode_lines_cleared))]
-            axes[0,1].plot(range(window, len(self.episode_lines_cleared)), lines_ma, 
-                          color='darkgreen', linewidth=2, label=f'MA({window})')
-        axes[0,1].set_title('Lines Cleared per Episode')
-        axes[0,1].set_xlabel('Episode')
-        axes[0,1].set_ylabel('Lines Cleared')
-        axes[0,1].grid(True, alpha=0.3)
-        if len(self.episode_lines_cleared) > 100:
-            axes[0,1].legend()
+        return default_config
+    
+    def merge_config(self, default, user):
+        """Recursively merge user config into default config"""
+        for key, value in user.items():
+            if key in default and isinstance(default[key], dict) and isinstance(value, dict):
+                self.merge_config(default[key], value)
+            else:
+                default[key] = value
+    
+    def setup_directories(self):
+        """Create necessary directories for saving models and logs"""
+        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.base_dir = f"tetris_visual_training_{self.timestamp}"
         
-        # 3. Episode Duration (Moves)
-        axes[0,2].plot(self.episode_moves, color='orange', alpha=0.7)
-        if len(self.episode_moves) > 100:
-            moves_ma = [np.mean(self.episode_moves[max(0, i-50):i+1]) 
-                       for i in range(50, len(self.episode_moves))]
-            axes[0,2].plot(range(50, len(self.episode_moves)), moves_ma, 
-                          color='darkorange', linewidth=2, label='MA(50)')
-        axes[0,2].set_title('Moves per Episode')
-        axes[0,2].set_xlabel('Episode')
-        axes[0,2].set_ylabel('Number of Moves')
-        axes[0,2].grid(True, alpha=0.3)
-        if len(self.episode_moves) > 100:
-            axes[0,2].legend()
+        self.dirs = {
+            'models': os.path.join(self.base_dir, 'models'),
+            'logs': os.path.join(self.base_dir, 'logs'),
+            'plots': os.path.join(self.base_dir, 'plots'),
+            'videos': os.path.join(self.base_dir, 'videos')
+        }
         
-        # 4. Training Loss
-        if self.losses:
-            axes[1,0].plot(self.losses, color='red', alpha=0.6)
-            if len(self.losses) > 100:
-                loss_ma = [np.mean(self.losses[max(0, i-100):i+1]) 
-                          for i in range(100, len(self.losses))]
-                axes[1,0].plot(range(100, len(self.losses)), loss_ma, 
-                              color='darkred', linewidth=2, label='MA(100)')
-            axes[1,0].set_title('Training Loss')
-            axes[1,0].set_xlabel('Training Step')
-            axes[1,0].set_ylabel('Loss')
-            axes[1,0].set_yscale('log')
-            axes[1,0].grid(True, alpha=0.3)
-            if len(self.losses) > 100:
-                axes[1,0].legend()
+        for dir_path in self.dirs.values():
+            os.makedirs(dir_path, exist_ok=True)
         
-        # 5. Epsilon Decay
-        axes[1,1].plot(self.epsilon_history, color='purple', linewidth=2)
-        axes[1,1].set_title('Epsilon Decay (Exploration Rate)')
-        axes[1,1].set_xlabel('Episode')
-        axes[1,1].set_ylabel('Epsilon')
-        axes[1,1].grid(True, alpha=0.3)
+        print(f"Training directory: {self.base_dir}")
+    
+    def setup_training_params(self):
+        """Setup training parameters from config"""
+        self.episodes = self.config['training']['episodes']
+        self.max_steps = self.config['training']['max_steps_per_episode']
+        self.save_interval = self.config['training']['save_interval']
+        self.eval_interval = self.config['training']['eval_interval']
+        self.eval_episodes = self.config['training']['eval_episodes']
+        self.render_training = self.config['training']['render_training']
+        self.render_evaluation = self.config['training']['render_evaluation']
         
-        # 6. Learning Rate
-        if self.learning_rates:
-            axes[1,2].plot(self.learning_rates, color='brown', linewidth=2)
-            axes[1,2].set_title('Learning Rate Schedule')
-            axes[1,2].set_xlabel('Episode')
-            axes[1,2].set_ylabel('Learning Rate')
-            axes[1,2].set_yscale('log')
-            axes[1,2].grid(True, alpha=0.3)
+        self.log_interval = self.config['logging']['log_interval']
+        self.plot_interval = self.config['logging']['plot_interval']
+    
+    def setup_components(self):
+        """Initialize agent, environment, and preprocessing components"""
+        # Environment
+        self.env = TetrisEnv(render_mode=self.render_training)
+        self.eval_env = TetrisEnv(render_mode=self.render_evaluation)
         
-        # 7. Value Estimates
-        if self.value_estimates:
-            axes[2,0].plot(self.value_estimates, color='cyan', alpha=0.7)
-            if len(self.value_estimates) > 100:
-                value_ma = [np.mean(self.value_estimates[max(0, i-100):i+1]) 
-                           for i in range(100, len(self.value_estimates))]
-                axes[2,0].plot(range(100, len(self.value_estimates)), value_ma, 
-                              color='darkcyan', linewidth=2, label='MA(100)')
-            axes[2,0].set_title('Average Value Estimates')
-            axes[2,0].set_xlabel('Training Step')
-            axes[2,0].set_ylabel('Value')
-            axes[2,0].grid(True, alpha=0.3)
-            if len(self.value_estimates) > 100:
-                axes[2,0].legend()
+        # Agent
+        agent_config = self.config['agent']
+        self.agent = TetrisVisualAgent(
+            input_shape=tuple(agent_config['input_shape']),
+            num_actions=agent_config['num_actions'],
+            use_amp=agent_config['use_amp']
+        )
         
-        # 8. Memory Usage
-        axes[2,1].plot(self.memory_sizes, color='magenta', linewidth=2)
-        axes[2,1].set_title('Replay Buffer Size')
-        axes[2,1].set_xlabel('Episode')
-        axes[2,1].set_ylabel('Memory Size')
-        axes[2,1].grid(True, alpha=0.3)
+        # Override agent parameters with config
+        self.agent.batch_size = agent_config['batch_size']
+        self.agent.memory = deque(maxlen=agent_config['memory_size'])
+        self.agent.epsilon = agent_config['epsilon_start']
+        self.agent.epsilon_min = agent_config['epsilon_end']
+        self.agent.epsilon_decay = agent_config['epsilon_decay']
+        self.agent.target_update_frequency = agent_config['target_update_freq']
         
-        # 9. Performance Distribution
-        if len(self.episode_rewards) > 100:
-            recent_rewards = self.episode_rewards[-500:] if len(self.episode_rewards) > 500 else self.episode_rewards
-            axes[2,2].hist(recent_rewards, bins=30, alpha=0.7, color='skyblue', edgecolor='black')
-            axes[2,2].axvline(np.mean(recent_rewards), color='red', linestyle='--', 
-                             label=f'Mean: {np.mean(recent_rewards):.1f}')
-            axes[2,2].set_title('Recent Reward Distribution')
-            axes[2,2].set_xlabel('Reward')
-            axes[2,2].set_ylabel('Frequency')
-            axes[2,2].legend()
-            axes[2,2].grid(True, alpha=0.3)
+        # Screenshot processor
+        prep_config = self.config['preprocessing']
+        self.processor = ScreenshotProcessor(
+            target_size=tuple(prep_config['target_size']),
+            grayscale=prep_config['grayscale']
+        )
         
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.show()
-        print(f"Training analytics saved to {save_path}")
-
-def normalize_state(obs):
-    """Create state representation with board and height map"""
-    grid = obs["grid"].copy().astype(np.float32)
+        # Set environment and processor for the agent
+        self.agent.set_env_and_processor(self.env, self.processor)
+        
+        # Frame buffers
+        self.train_frame_buffer = FrameBuffer(capacity=prep_config['frame_stack'])
+        self.eval_frame_buffer = FrameBuffer(capacity=prep_config['frame_stack'])
     
-    # Normalize grid values
-    normalized_grid = np.where(grid > 0, 1.0, 0.0)
+    def setup_tracking(self):
+        """Setup training progress tracking"""
+        self.training_stats = {
+            'episode_rewards': [],
+            'episode_lengths': [],
+            'episode_lines_cleared': [],
+            'losses': [],
+            'q_values': [],
+            'epsilons': [],
+            'eval_rewards': [],
+            'eval_lengths': [],
+            'eval_lines_cleared': []
+        }
+        
+        self.best_eval_score = -float('inf')
+        self.training_start_time = time.time()
     
-    # Create height map
-    height_map = np.zeros_like(grid, dtype=np.float32)
-    for col in range(grid.shape[1]):
-        for row in range(grid.shape[0]):
-            if grid[row, col] > 0:
-                height = grid.shape[0] - row
-                height_map[:, col] = height / grid.shape[0]
-                break
+    def signal_handler(self, signum, frame):
+        """Handle graceful shutdown on Ctrl+C"""
+        print("\nShutdown requested. Saving progress...")
+        self.shutdown_requested = True
     
-    # Combine both maps into multi-channel representation
-    return np.stack([normalized_grid, height_map], axis=0)
-
-def execute_placement_action(env, placement_action):
-    """Execute a placement action (rotation, column) in the environment"""
-    if placement_action is None:
-        return None, -50.0, True  # Game over penalty
+    def get_state_representation(self, obs, frame_buffer):
+        """Convert environment observation to neural network input"""
+        # Capture screenshot
+        screenshot = self.processor.capture_game_screen(self.env)
+        
+        # Preprocess
+        processed_frame = self.processor.preprocess_screenshot(screenshot)
+        
+        # Add to frame buffer
+        frame_buffer.add_frame(processed_frame)
+        
+        # Get stacked frames
+        stacked_frames = frame_buffer.get_stacked_frames()
+        
+        return stacked_frames
     
-    rotation, target_col = placement_action
+    def calculate_shaped_reward(self, obs, reward, done, lines_cleared):
+        """Calculate shaped reward for better learning"""
+        shaped_reward = reward
+        
+        # Line clear bonus
+        if lines_cleared > 0:
+            shaped_reward += lines_cleared * self.config['rewards']['line_clear_multiplier']
+        
+        # Survival bonus
+        if not done:
+            shaped_reward += self.config['rewards']['survival_bonus']
+        
+        # Height penalty (encourage keeping the board low)
+        if obs and 'grid' in obs:
+            grid = obs['grid']
+            filled_rows = 0
+            for row_idx, row in enumerate(grid):
+                if np.any(row):
+                    filled_rows = len(grid) - row_idx
+                    break
+            shaped_reward += filled_rows * self.config['rewards']['height_penalty']
+        
+        return shaped_reward
     
-    # Get current piece and position
-    current_piece = env.current_piece.copy()
-    current_pos = env.current_pos.copy()
-    
-    # Apply rotations
-    for _ in range(rotation):
-        rotated = env.rotate(current_piece)
-        if not env.collision(rotated, current_pos):
-            current_piece = rotated
-            env.current_piece = rotated
-    
-    # Move to target column
-    target_x = target_col
-    current_x = current_pos[1]
-    
-    # Move piece to target column
-    if target_x < current_x:
-        # Move left
-        for _ in range(current_x - target_x):
-            if not env.collision(env.current_piece, (current_pos[0], current_pos[1] - 1)):
-                current_pos[1] -= 1
-                env.current_pos[1] -= 1
-    elif target_x > current_x:
-        # Move right
-        for _ in range(target_x - current_x):
-            if not env.collision(env.current_piece, (current_pos[0], current_pos[1] + 1)):
-                current_pos[1] += 1
-                env.current_pos[1] += 1
-    
-    # Hard drop
-    lines_cleared = 0
-    while not env.collision(env.current_piece, (env.current_pos[0] + 1, env.current_pos[1])):
-        env.current_pos[0] += 1
-    
-    # Place piece and clear lines
-    lines_cleared = env.freeze()
-    
-    # Calculate reward based on lines cleared - FIXED VALUES
-    reward = 0.0
-    if lines_cleared == 1:
-        reward = 20.0
-    elif lines_cleared == 2:
-        reward = 60.0
-    elif lines_cleared == 3:
-        reward = 200.0
-    elif lines_cleared == 4:
-        reward = 500.0
-    
-    return env.get_observation(), reward, env.game_over
-
-def test_trained_model(model_path, num_games=10, render=True):
-    """Test a trained model and return performance statistics"""
-    print(f"\n{'='*50}")
-    print("TESTING TRAINED MODEL")
-    print(f"Model: {model_path}")
-    print(f"Number of test games: {num_games}")
-    print(f"{'='*50}\n")
-    
-    # Setup environment
-    env = TetrisEnv(render_mode=render)
-    state_shape = (2, 20, 10)
-    
-    # Initialize agent
-    agent = TetrisGroupedAgent(state_shape=state_shape, use_amp=True)
-    
-    # Load trained model
-    try:
-        agent.load(model_path)
-        agent.epsilon = 0.0  # No exploration during testing
-        print(f"✓ Model loaded successfully from {model_path}")
-    except Exception as e:
-        print(f"✗ Error loading model: {e}")
-        return None
-    
-    # Test statistics
-    test_results = {
-        'rewards': [],
-        'lines_cleared': [],
-        'moves': [],
-        'max_reward': float('-inf'),
-        'min_reward': float('inf'),
-        'total_lines': 0
-    }
-    
-    for game in range(num_games):
-        raw_state = env.reset()
-        state = normalize_state(raw_state)
+    def train_episode(self, episode):
+        """Train for one episode"""
+        obs = self.env.reset()
+        self.train_frame_buffer.reset()
+        
+        # Get initial state
+        state = self.get_state_representation(obs, self.train_frame_buffer)
+        if state is None:
+            return 0, 0, 0  # Skip if state is None
         
         total_reward = 0
-        total_lines_cleared = 0
-        moves_made = 0
-        done = False
-        
-        print(f"\nGame {game + 1}/{num_games}")
-        print("-" * 30)
-        
-        while not done:
-            # Get current piece
-            current_piece = env.current_piece.copy()
-            
-            # Select best action (no exploration)
-            placement_action = agent.select_action(raw_state, current_piece, training=False)
-            
-            # Execute placement
-            raw_next_state, reward, done = execute_placement_action(env, placement_action)
-            
-            if raw_next_state is None:
-                break
-            
-            # Update for next iteration
-            raw_state = raw_next_state
-            total_reward += reward
-            moves_made += 1
-            
-            # Count lines cleared - FIXED VALUES
-            if reward > 0:
-                if reward >= 500:
-                    lines_this_move = 4
-                elif reward >= 200:
-                    lines_this_move = 3
-                elif reward >= 60:
-                    lines_this_move = 2
-                elif reward >= 20:
-                    lines_this_move = 1
-                else:
-                    lines_this_move = 0
-                total_lines_cleared += lines_this_move
-                print(f"  Lines cleared: {lines_this_move} (Total: {total_lines_cleared})")
-            
-            # Render if enabled
-            if render:
-                env.render()
-                time.sleep(0.05)  # Slower for better viewing
-        
-        # Store results
-        test_results['rewards'].append(total_reward)
-        test_results['lines_cleared'].append(total_lines_cleared)
-        test_results['moves'].append(moves_made)
-        test_results['total_lines'] += total_lines_cleared
-        test_results['max_reward'] = max(test_results['max_reward'], total_reward)
-        test_results['min_reward'] = min(test_results['min_reward'], total_reward)
-        
-        print(f"  Final Score: {total_reward:.1f}")
-        print(f"  Lines Cleared: {total_lines_cleared}")
-        print(f"  Moves Made: {moves_made}")
-        print(f"  Efficiency: {total_lines_cleared/moves_made:.3f} lines/move" if moves_made > 0 else "  Efficiency: 0.000")
-    
-    env.close()
-    
-    # Calculate statistics
-    avg_reward = np.mean(test_results['rewards'])
-    std_reward = np.std(test_results['rewards'])
-    avg_lines = np.mean(test_results['lines_cleared'])
-    avg_moves = np.mean(test_results['moves'])
-    
-    print(f"\n{'='*50}")
-    print("TEST RESULTS SUMMARY")
-    print(f"{'='*50}")
-    print(f"Average Reward: {avg_reward:.1f} ± {std_reward:.1f}")
-    print(f"Best Game: {test_results['max_reward']:.1f}")
-    print(f"Worst Game: {test_results['min_reward']:.1f}")
-    print(f"Average Lines Cleared: {avg_lines:.1f}")
-    print(f"Total Lines Cleared: {test_results['total_lines']}")
-    print(f"Average Moves per Game: {avg_moves:.1f}")
-    print(f"Overall Efficiency: {test_results['total_lines']/(sum(test_results['moves'])):.3f} lines/move")
-    print(f"{'='*50}")
-    
-    # Create test results visualization
-    plot_test_results(test_results, model_path)
-    
-    return test_results
-
-def plot_test_results(test_results, model_path):
-    """Create visualization of test results"""
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    fig.suptitle(f'Test Results: {os.path.basename(model_path)}', fontsize=14, fontweight='bold')
-    
-    games = list(range(1, len(test_results['rewards']) + 1))
-    
-    # 1. Rewards per game
-    axes[0,0].bar(games, test_results['rewards'], color='skyblue', alpha=0.7, edgecolor='navy')
-    axes[0,0].axhline(np.mean(test_results['rewards']), color='red', linestyle='--', 
-                     label=f'Average: {np.mean(test_results["rewards"]):.1f}')
-    axes[0,0].set_title('Rewards per Game')
-    axes[0,0].set_xlabel('Game')
-    axes[0,0].set_ylabel('Total Reward')
-    axes[0,0].legend()
-    axes[0,0].grid(True, alpha=0.3)
-    
-    # 2. Lines cleared per game
-    axes[0,1].bar(games, test_results['lines_cleared'], color='lightgreen', alpha=0.7, edgecolor='darkgreen')
-    axes[0,1].axhline(np.mean(test_results['lines_cleared']), color='red', linestyle='--',
-                     label=f'Average: {np.mean(test_results["lines_cleared"]):.1f}')
-    axes[0,1].set_title('Lines Cleared per Game')
-    axes[0,1].set_xlabel('Game')
-    axes[0,1].set_ylabel('Lines Cleared')
-    axes[0,1].legend()
-    axes[0,1].grid(True, alpha=0.3)
-    
-    # 3. Moves per game
-    axes[1,0].bar(games, test_results['moves'], color='orange', alpha=0.7, edgecolor='darkorange')
-    axes[1,0].axhline(np.mean(test_results['moves']), color='red', linestyle='--',
-                     label=f'Average: {np.mean(test_results["moves"]):.1f}')
-    axes[1,0].set_title('Moves per Game')
-    axes[1,0].set_xlabel('Game')
-    axes[1,0].set_ylabel('Number of Moves')
-    axes[1,0].legend()
-    axes[1,0].grid(True, alpha=0.3)
-    
-    # 4. Efficiency (lines/move)
-    efficiency = [lines/moves if moves > 0 else 0 
-                 for lines, moves in zip(test_results['lines_cleared'], test_results['moves'])]
-    axes[1,1].bar(games, efficiency, color='purple', alpha=0.7, edgecolor='purple')
-    axes[1,1].axhline(np.mean(efficiency), color='red', linestyle='--',
-                     label=f'Average: {np.mean(efficiency):.3f}')
-    axes[1,1].set_title('Efficiency (Lines/Move)')
-    axes[1,1].set_xlabel('Game')
-    axes[1,1].set_ylabel('Lines per Move')
-    axes[1,1].legend()
-    axes[1,1].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_path = f"test_results_{timestamp}.png"
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.show()
-    print(f"Test results visualization saved to {save_path}")
-
-def train_tetris_agent(episodes=3000, render_every=200, save_every=200, test_during_training=True):
-    # Setup environment
-    env = TetrisEnv(render_mode=False)
-    state_shape = (2, 20, 10)  # 2 channels: board + height map
-    
-    # Initialize agent
-    agent = TetrisGroupedAgent(
-        state_shape=state_shape,
-        use_amp=True
-    )
-    
-    # Initialize analytics
-    analytics = TetrisTrainingAnalytics()
-    
-    # Training metrics
-    best_reward = float('-inf')
-    plateau_counter = 0
-    start_time = time.time()
-    
-    print("\n" + "="*50)
-    print("Starting Grouped Actions DQN Training")
-    print(f"Device: {agent.device}")
-    print(f"AMP Enabled: {agent.use_amp}")
-    print(f"State shape: {state_shape}")
-    print(f"Epsilon start: {agent.epsilon}, min: {agent.epsilon_min}")
-    print("="*50 + "\n")
-
-    for episode in range(episodes):
-        episode_start_time = time.time()
-        
-        raw_state = env.reset()
-        state = normalize_state(raw_state)
-        state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(agent.device)
-        
-        total_reward = 0
-        done = False
-        moves_made = 0
-        total_lines_cleared = 0
+        steps = 0
+        lines_cleared = 0
         episode_losses = []
-
-        while not done:
-            # Get current piece
-            current_piece = env.current_piece.copy()
-            
-            # Select placement action
-            placement_action = agent.select_action(raw_state, current_piece, training=True)
-            
-            # Execute placement
-            raw_next_state, reward, done = execute_placement_action(env, placement_action)
-            
-            if raw_next_state is None:
+        
+        for step in range(self.max_steps):
+            if self.shutdown_requested:
                 break
+
+            # Select action
+            action = self.agent.select_action(obs, training=True)
             
-            next_state = normalize_state(raw_next_state)
-            next_state_tensor = torch.from_numpy(next_state).float().unsqueeze(0).to(agent.device)
+            # Take step in environment
+            next_obs, env_reward, done = self.env.step(action)
+            
+            # Count lines cleared
+            if hasattr(self.env, 'score'):
+                current_lines = self.env.score
+                if current_lines > lines_cleared:
+                    lines_cleared = current_lines
+            
+            # Get next state
+            next_state = self.get_state_representation(next_obs, self.train_frame_buffer)
+            
+            # Calculate shaped reward
+            shaped_reward = self.calculate_shaped_reward(next_obs, env_reward, done, 
+                                                       lines_cleared if env_reward > 0 else 0)
             
             # Store experience
-            agent.remember(state_tensor, placement_action, reward, next_state_tensor, done)
+            if next_state is not None:
+                self.agent.remember(state, action, shaped_reward, next_state, done)
             
-            # Train
-            if len(agent.memory) >= agent.batch_size:
-                loss = agent.replay(episode)
+            total_reward += env_reward
+            steps += 1
+            
+            # Train agent
+            if (self.agent.steps >= self.config['agent']['training_start'] and 
+                self.agent.steps % self.agent.update_frequency == 0):
+                loss = self.agent.replay()
                 if loss is not None:
                     episode_losses.append(loss)
             
-            # Update for next iteration
-            state_tensor = next_state_tensor
-            raw_state = raw_next_state
-            total_reward += reward
-            moves_made += 1
+            # Update target network
+            if self.agent.steps % self.agent.target_update_frequency == 0:
+                self.agent.update_target_network()
             
-            # Count lines cleared - FIXED VALUES
-            if reward > 0:
-                if reward >= 500:
-                    total_lines_cleared += 4
-                elif reward >= 200:
-                    total_lines_cleared += 3
-                elif reward >= 60:
-                    total_lines_cleared += 2
-                elif reward >= 20:
-                    total_lines_cleared += 1
+            # Update state
+            state = next_state
+            self.agent.steps += 1
             
-            # Render occasionally
-            if episode % render_every == 0 and episode > 0:
-                if not env.render_mode:
-                    env.render_mode = True
-                    env.__init__(render_mode=True)
-                env.render()
-                time.sleep(0.1)
-
-        # Calculate episode duration
-        episode_duration = time.time() - episode_start_time
+            # Render if enabled
+            if self.render_training:
+                self.env.render()
+                time.sleep(0.01)  # Small delay for visibility
+            
+            if done:
+                break
         
-        # Update statistics
-        avg_reward = agent.update_stats(episode, total_reward)
+        # Update epsilon
+        self.agent.update_epsilon()
         
-        # Get current learning rate
-        current_lr = agent.optimizer.param_groups[0]['lr']
+        # Update stats
+        avg_loss = np.mean(episode_losses) if episode_losses else 0
         
-        # Calculate average loss for this episode
-        avg_loss = np.mean(episode_losses) if episode_losses else None
-        avg_value = np.mean(agent.training_stats['values'][-10:]) if agent.training_stats['values'] else None
+        return total_reward, steps, lines_cleared, avg_loss
+    
+    def evaluate_agent(self, num_episodes=None):
+        """Evaluate agent performance"""
+        if num_episodes is None:
+            num_episodes = self.eval_episodes
         
-        # Update analytics
-        analytics.update(
-            episode=episode,
-            reward=total_reward,
-            lines_cleared=total_lines_cleared,
-            moves=moves_made,
-            duration=episode_duration,
-            loss=avg_loss,
-            epsilon=agent.epsilon,
-            lr=current_lr,
-            avg_reward=avg_reward,
-            memory_size=len(agent.memory),
-            avg_value=avg_value
-        )
+        eval_rewards = []
+        eval_lengths = []
+        eval_lines = []
         
-        # Logging
-        if episode % 25 == 0 or episode < 25:
-            time_elapsed = (time.time() - start_time) / 60
-            print(f"\nEpisode {episode + 1}/{episodes} ({time_elapsed:.1f} min)")
-            print(f"  Total Reward: {total_reward:.1f}")
-            print(f"  Lines Cleared: {total_lines_cleared}")
-            print(f"  Moves Made: {moves_made}")
-            print(f"  Episode Duration: {episode_duration:.2f}s")
-            if len(agent.recent_rewards) >= 25:
-                print(f"  Avg Reward (25): {avg_reward:.1f}")
-            print(f"  Epsilon: {agent.epsilon:.4f}")
-            print(f"  Learning Rate: {current_lr:.2e}")
-            print(f"  Memory Size: {len(agent.memory)}")
-            if avg_loss is not None:
-                print(f"  Avg Loss: {avg_loss:.6f}")
-            if avg_value is not None:
-                print(f"  Avg Value: {avg_value:.3f}")
-            print("-" * 40)
-        
-        # Save model periodically
-        if episode % save_every == 0 and episode > 0:
-            filename = f"tetris_grouped_model_ep_{episode}.pth"
-            agent.save(filename)
-        
-        # Test during training
-        if test_during_training and episode % (episodes // 5) == 0 and episode > 0:
-            print(f"\n🧪 Running test at episode {episode}...")
-            test_results = test_trained_model(f"tetris_grouped_model_ep_{episode}.pth", 
-                                            num_games=3, render=False)
-        
-        # Check for improvement
-        if len(agent.recent_rewards) >= 50:
-            current_avg = np.mean(list(agent.recent_rewards)[-50:])
-            if current_avg > best_reward:
-                best_reward = current_avg
-                plateau_counter = 0
-                agent.save("best_grouped_tetris_model.pth")
-                print(f"✓ New best average reward: {best_reward:.1f}")
-            else:
-                plateau_counter += 1
+        for eval_ep in range(num_episodes):
+            obs = self.eval_env.reset()
+            self.eval_frame_buffer.reset()
+            
+            state = self.get_state_representation(obs, self.eval_frame_buffer)
+            if state is None:
+                continue
+            
+            total_reward = 0
+            steps = 0
+            lines_cleared = 0
+            
+            for step in range(self.max_steps):
+                # Select action (no exploration)
+                action = self.agent.select_action(obs, training=False)
                 
-            # Adjust exploration if plateau detected
-            if plateau_counter > 100:
-                agent.epsilon = min(0.2, agent.epsilon * 1.5)
-                plateau_counter = 0
-                print("⚠ Plateau detected, increasing exploration")
+                # Take step
+                next_obs, reward, done = self.eval_env.step(action)
+                
+                # Count lines
+                if hasattr(self.eval_env, 'score'):
+                    lines_cleared = self.eval_env.score
+                
+                total_reward += reward
+                steps += 1
+                
+                # Get next state
+                state = self.get_state_representation(next_obs, self.eval_frame_buffer)
+                
+                # Render if enabled
+                if self.render_evaluation:
+                    self.eval_env.render()
+                    time.sleep(0.02)
+                
+                if done or state is None:
+                    break
+            
+            eval_rewards.append(total_reward)
+            eval_lengths.append(steps)
+            eval_lines.append(lines_cleared)
         
-        # Turn off rendering after demo
-        if episode % render_every == 0 and episode > 0:
-            env.render_mode = False
+        avg_reward = np.mean(eval_rewards)
+        avg_length = np.mean(eval_lengths)
+        avg_lines = np.mean(eval_lines)
         
-        # Generate analytics plots periodically
-        if episode % 500 == 0 and episode > 0:
-            analytics.plot_training_analytics(f"training_progress_ep_{episode}.png")
+        return avg_reward, avg_length, avg_lines
+    
+    def save_checkpoint(self, episode, is_best=False):
+        """Save model checkpoint"""
+        filename = f"tetris_visual_ep{episode}.pth"
+        if is_best:
+            filename = f"tetris_visual_best.pth"
+        
+        filepath = os.path.join(self.dirs['models'], filename)
+        
+        checkpoint = {
+            'episode': episode,
+            'agent_state': {
+                'model_state_dict': self.agent.q_network.state_dict(),
+                'target_state_dict': self.agent.target_network.state_dict(),
+                'optimizer_state_dict': self.agent.optimizer.state_dict(),
+                'epsilon': self.agent.epsilon,
+                'steps': self.agent.steps
+            },
+            'training_stats': self.training_stats,
+            'config': self.config
+        }
+        
+        torch.save(checkpoint, filepath)
+        print(f"Checkpoint saved: {filepath}")
+    
+    def load_checkpoint(self, filepath):
+        """Load model checkpoint"""
+        checkpoint = torch.load(filepath, map_location=self.agent.device)
+        
+        # Load agent state
+        self.agent.q_network.load_state_dict(checkpoint['agent_state']['model_state_dict'])
+        self.agent.target_network.load_state_dict(checkpoint['agent_state']['target_state_dict'])
+        self.agent.optimizer.load_state_dict(checkpoint['agent_state']['optimizer_state_dict'])
+        self.agent.epsilon = checkpoint['agent_state']['epsilon']
+        self.agent.steps = checkpoint['agent_state']['steps']
+        
+        # Load training stats
+        self.training_stats = checkpoint['training_stats']
+        
+        return checkpoint['episode']
+    
+    def plot_training_progress(self, episode):
+        """Create and save training progress plots"""
+        if not self.config['logging']['save_plots']:
+            return
+        
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        fig.suptitle(f'Tetris Visual Training Progress - Episode {episode}')
+        
+        # Episode rewards
+        if self.training_stats['episode_rewards']:
+            axes[0, 0].plot(self.training_stats['episode_rewards'])
+            axes[0, 0].set_title('Episode Rewards')
+            axes[0, 0].set_xlabel('Episode')
+            axes[0, 0].set_ylabel('Reward')
+        
+        # Episode lengths
+        if self.training_stats['episode_lengths']:
+            axes[0, 1].plot(self.training_stats['episode_lengths'])
+            axes[0, 1].set_title('Episode Lengths')
+            axes[0, 1].set_xlabel('Episode')
+            axes[0, 1].set_ylabel('Steps')
+        
+        # Lines cleared
+        if self.training_stats['episode_lines_cleared']:
+            axes[0, 2].plot(self.training_stats['episode_lines_cleared'])
+            axes[0, 2].set_title('Lines Cleared per Episode')
+            axes[0, 2].set_xlabel('Episode')
+            axes[0, 2].set_ylabel('Lines')
+        
+        # Training loss
+        if self.training_stats['losses']:
+            axes[1, 0].plot(self.training_stats['losses'])
+            axes[1, 0].set_title('Training Loss')
+            axes[1, 0].set_xlabel('Training Step')
+            axes[1, 0].set_ylabel('Loss')
+        
+        # Epsilon decay
+        if self.training_stats['epsilons']:
+            axes[1, 1].plot(self.training_stats['epsilons'])
+            axes[1, 1].set_title('Epsilon Decay')
+            axes[1, 1].set_xlabel('Episode')
+            axes[1, 1].set_ylabel('Epsilon')
+        
+        # Evaluation scores
+        if self.training_stats['eval_rewards']:
+            axes[1, 2].plot(range(0, len(self.training_stats['eval_rewards']) * self.eval_interval, 
+                                self.eval_interval), self.training_stats['eval_rewards'])
+            axes[1, 2].set_title('Evaluation Rewards')
+            axes[1, 2].set_xlabel('Episode')
+            axes[1, 2].set_ylabel('Avg Reward')
+        
+        plt.tight_layout()
+        plot_path = os.path.join(self.dirs['plots'], f'training_progress_ep{episode}.png')
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    def train(self, resume_from=None):
+        """Main training loop"""
+        start_episode = 0
+        
+        # Resume from checkpoint if specified
+        if resume_from:
+            start_episode = self.load_checkpoint(resume_from)
+            print(f"Resumed training from episode {start_episode}")
+        
+        print(f"Starting visual Tetris training...")
+        print(f"Episodes: {self.episodes}")
+        print(f"Device: {self.agent.device}")
+        print(f"Using AMP: {self.agent.use_amp}")
+        
+        try:
+            for episode in range(start_episode, self.episodes):
+                if self.shutdown_requested:
+                    break
+                
+                # Train episode
+                episode_reward, episode_length, lines_cleared, avg_loss = self.train_episode(episode)
+                
+                # Update stats
+                self.training_stats['episode_rewards'].append(episode_reward)
+                self.training_stats['episode_lengths'].append(episode_length)
+                self.training_stats['episode_lines_cleared'].append(lines_cleared)
+                self.training_stats['epsilons'].append(self.agent.epsilon)
+                
+                if avg_loss > 0:
+                    self.training_stats['losses'].append(avg_loss)
+                
+                # Logging
+                if episode % self.log_interval == 0:
+                    elapsed_time = time.time() - self.training_start_time
+                    eps_per_hour = (episode - start_episode + 1) / (elapsed_time / 3600)
+                    
+                    print(f"Episode {episode:5d} | "
+                          f"Reward: {episode_reward:6.1f} | "
+                          f"Length: {episode_length:4d} | "
+                          f"Lines: {lines_cleared:3d} | "
+                          f"Loss: {avg_loss:6.3f} | "
+                          f"Epsilon: {self.agent.epsilon:.3f} | "
+                          f"Speed: {eps_per_hour:.1f} eps/h")
+                
+                # Evaluation
+                if episode % self.eval_interval == 0 and episode > 0:
+                    eval_reward, eval_length, eval_lines = self.evaluate_agent()
+                    
+                    self.training_stats['eval_rewards'].append(eval_reward)
+                    self.training_stats['eval_lengths'].append(eval_length)
+                    self.training_stats['eval_lines_cleared'].append(eval_lines)
+                    
+                    print(f"EVAL  {episode:5d} | "
+                          f"Reward: {eval_reward:6.1f} | "
+                          f"Length: {eval_length:4.1f} | "
+                          f"Lines: {eval_lines:4.1f}")
+                    
+                    # Save best model
+                    if eval_reward > self.best_eval_score:
+                        self.best_eval_score = eval_reward
+                        self.save_checkpoint(episode, is_best=True)
+                        print(f"New best model saved! Score: {eval_reward:.1f}")
+                
+                # Save checkpoint
+                if episode % self.save_interval == 0 and episode > 0:
+                    self.save_checkpoint(episode)
+                
+                # Plot progress
+                if episode % self.plot_interval == 0 and episode > 0:
+                    self.plot_training_progress(episode)
+        
+        except KeyboardInterrupt:
+            print("\nTraining interrupted by user")
+        
+        finally:
+            # Final save
+            self.save_checkpoint(episode, is_best=False)
+            self.plot_training_progress(episode)
+            
+            # Cleanup
+            self.env.close()
+            self.eval_env.close()
+            
+            print(f"\nTraining completed!")
+            print(f"Total episodes: {episode - start_episode + 1}")
+            print(f"Best evaluation score: {self.best_eval_score:.1f}")
+            print(f"Results saved in: {self.base_dir}")
 
-    # Save final model
-    agent.save("final_grouped_tetris_model.pth")
-    env.close()
-    
-    # Final analytics
-    analytics.plot_training_analytics("final_training_analytics.png")
-    
-    # Final stats
-    total_time = (time.time() - start_time) / 3600
-    print("\n" + "="*50)
-    print("GROUPED ACTIONS TRAINING COMPLETE")
-    print(f"Best 50-episode avg: {best_reward:.1f}")
-    print(f"Final epsilon: {agent.epsilon:.4f}")
-    print(f"Total training steps: {agent.steps}")
-    print(f"Training time: {total_time:.2f} hours")
-    if agent.training_stats['losses']:
-        print(f"Final avg loss: {np.mean(agent.training_stats['losses'][-50:]):.6f}")
-    print("="*50)
-    
-    return analytics
 
-if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Tetris DQN Training and Testing')
-    parser.add_argument('--mode', choices=['train', 'test', 'both'], default='both',
-                       help='Mode: train, test, or both')
-    parser.add_argument('--episodes', type=int, default=3000,
-                       help='Number of training episodes')
-    parser.add_argument('--model_path', type=str, default='best_grouped_tetris_model.pth',
-                       help='Path to model for testing')
-    parser.add_argument('--test_games', type=int, default=10,
-                       help='Number of games to test')
+def main():
+    """Main function with command line interface"""
+    parser = argparse.ArgumentParser(description='Train Visual Tetris RL Agent')
+    parser.add_argument('--config', type=str, default='training_config.json',
+                       help='Path to training configuration file')
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Path to checkpoint to resume training from')
+    parser.add_argument('--episodes', type=int, default=None,
+                       help='Number of episodes to train (overrides config)')
     parser.add_argument('--render', action='store_true',
-                       help='Render during testing')
+                       help='Enable rendering during training')
+    parser.add_argument('--eval-only', action='store_true',
+                       help='Only run evaluation (requires --resume)')
     
     args = parser.parse_args()
     
-    if args.mode == 'train':
-        analytics = train_tetris_agent(episodes=args.episodes)
-    elif args.mode == 'test':
-        test_trained_model(args.model_path, num_games=args.test_games, render=args.render)
-    else:  # both
-        print("🚀 Starting training phase...")
-        analytics = train_tetris_agent(episodes=args.episodes)
+    # Create trainer
+    trainer = VisualTetrisTrainer(config_path=args.config)
+    
+    # Override config with command line arguments
+    if args.episodes:
+        trainer.episodes = args.episodes
+    if args.render:
+        trainer.render_training = True
+    
+    if args.eval_only:
+        if not args.resume:
+            print("Error: --eval-only requires --resume argument")
+            return
         
-        print("\n🎮 Starting testing phase...")
-        test_trained_model("best_grouped_tetris_model.pth", 
-                          num_games=args.test_games, render=args.render)
+        # Load model and evaluate
+        trainer.load_checkpoint(args.resume)
+        eval_reward, eval_length, eval_lines = trainer.evaluate_agent(num_episodes=10)
+        
+        print(f"\nEvaluation Results:")
+        print(f"Average Reward: {eval_reward:.2f}")
+        print(f"Average Length: {eval_length:.1f}")
+        print(f"Average Lines Cleared: {eval_lines:.1f}")
+    else:
+        # Start training
+        trainer.train(resume_from=args.resume)
+
+
+if __name__ == "__main__":
+    main()
