@@ -1,5 +1,5 @@
 {
-  "step_penalty": -0.01,
+  "step_penalty": 0.01,
   "drop_bonus": 0.5,
   "death_penalty": -100.0,
   "line_rewards": {
