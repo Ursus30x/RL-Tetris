@@ -25,13 +25,13 @@ class TetrisGroupedAgent:
         self.target_model.load_state_dict(self.model.state_dict())
         
         # Improved training parameters
-        self.memory = deque(maxlen=50000)  # Smaller buffer
+        self.memory = deque(maxlen=200000)  # Smaller buffer
         self.batch_size = 32  # Smaller batch size for more stable gradients
         self.gamma = 0.95  # Lower gamma for shorter episode horizon
         self.epsilon = 0.1
         self.epsilon_min = 0.01
         self.epsilon_decay = 0.9995  # Slower decay
-        self.tau = 0.001  # Slower target network updates
+        self.tau = 0.01  # Slower target network updates
         
         self.steps = 0
         self.recent_rewards = deque(maxlen=100)
